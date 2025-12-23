@@ -10,8 +10,18 @@ import (
 
 type Schema struct {
 	Tables []Table `json:"tables"`
+	// Types contains enum type definitions in the schema
+	Types []Type `json:"types,omitempty"`
 	// Dropped will be true if the schema has been deleted
 	Dropped bool `json:"dropped,omitempty"`
+}
+
+// Type represents a PostgreSQL type (currently only enums are supported)
+type Type struct {
+	Oid    string   `json:"oid"`
+	Name   string   `json:"name"`
+	Kind   string   `json:"kind"`             // "enum"
+	Values []string `json:"values,omitempty"` // enum values in order
 }
 
 type Table struct {
@@ -64,6 +74,16 @@ func (s *Schema) IsEqual(other *Schema) bool {
 			}
 		}
 
+		if len(s.Types) != len(other.Types) {
+			return false
+		}
+
+		for i := range s.Types {
+			if !s.Types[i].IsEqual(&other.Types[i]) {
+				return false
+			}
+		}
+
 		return true
 	}
 }
@@ -75,6 +95,39 @@ func (s *Schema) getTableByName(tableName string) (Table, bool) {
 		}
 	}
 	return Table{}, false
+}
+
+func (s *Schema) getTypeByName(typeName string) (Type, bool) {
+	for _, t := range s.Types {
+		if t.Name == typeName {
+			return t, true
+		}
+	}
+	return Type{}, false
+}
+
+// TypeNames returns the names of all types in the schema
+func (s *Schema) TypeNames() []string {
+	names := make([]string, 0, len(s.Types))
+	for _, t := range s.Types {
+		names = append(names, t.Name)
+	}
+	return names
+}
+
+// IsEqual compares two types for equality
+func (t *Type) IsEqual(other *Type) bool {
+	switch {
+	case t == nil && other == nil:
+		return true
+	case t == nil && other != nil, t != nil && other == nil:
+		return false
+	default:
+		if t.Oid != other.Oid || t.Name != other.Name || t.Kind != other.Kind {
+			return false
+		}
+		return slices.Equal(t.Values, other.Values)
+	}
 }
 
 func (s *Schema) TableNames() []string {

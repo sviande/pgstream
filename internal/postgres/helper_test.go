@@ -39,3 +39,7 @@ func (m *mockQuerier) Ping(ctx context.Context) error {
 func (m *mockQuerier) Close(ctx context.Context) error {
 	return nil
 }
+
+func (m *mockQuerier) RefreshEnumTypes(ctx context.Context) error {
+	return nil
+}

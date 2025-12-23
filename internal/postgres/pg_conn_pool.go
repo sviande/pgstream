@@ -106,3 +106,17 @@ func (c *Pool) Close(_ context.Context) error {
 	c.Pool.Close()
 	return nil
 }
+
+// RefreshEnumTypes re-registers all custom enum types on a connection from the pool.
+// Note: For a pool, this only refreshes one connection. New connections will
+// automatically register types via AfterConnect. Existing idle connections may
+// not have the new types until they are recycled.
+func (c *Pool) RefreshEnumTypes(ctx context.Context) error {
+	conn, err := c.Pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring connection: %w", err)
+	}
+	defer conn.Release()
+
+	return registerEnumTypes(ctx, conn.Conn())
+}

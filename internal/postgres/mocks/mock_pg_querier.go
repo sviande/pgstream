@@ -61,3 +61,7 @@ func (m *Querier) Close(ctx context.Context) error {
 	}
 	return nil
 }
+
+func (m *Querier) RefreshEnumTypes(ctx context.Context) error {
+	return nil
+}

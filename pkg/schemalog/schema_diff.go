@@ -10,6 +10,9 @@ type Diff struct {
 	TablesRemoved []Table
 	TablesAdded   []Table
 	TablesChanged []TableDiff
+	TypesRemoved  []Type
+	TypesAdded    []Type
+	TypesChanged  []TypeDiff
 }
 
 type TableDiff struct {
@@ -32,12 +35,20 @@ type ColumnDiff struct {
 	DefaultChange    *ValueChange[*string]
 }
 
+type TypeDiff struct {
+	TypeName    string
+	TypeOid     string
+	NameChange  *ValueChange[string]
+	ValuesAdded []string // New enum values added
+}
+
 type ValueChange[T any] struct {
 	Old, New T
 }
 
 func (d *Diff) IsEmpty() bool {
-	return len(d.TablesAdded) == 0 && len(d.TablesChanged) == 0 && len(d.TablesRemoved) == 0
+	return len(d.TablesAdded) == 0 && len(d.TablesChanged) == 0 && len(d.TablesRemoved) == 0 &&
+		len(d.TypesAdded) == 0 && len(d.TypesChanged) == 0 && len(d.TypesRemoved) == 0
 }
 
 func (td *TableDiff) IsEmpty() bool {
@@ -46,6 +57,10 @@ func (td *TableDiff) IsEmpty() bool {
 
 func (cd *ColumnDiff) IsEmpty() bool {
 	return cd.TypeChange == nil && cd.NameChange == nil && cd.DefaultChange == nil && cd.NullChange == nil && cd.UniqueChange == nil
+}
+
+func (td *TypeDiff) IsEmpty() bool {
+	return td.NameChange == nil && len(td.ValuesAdded) == 0
 }
 
 func ComputeSchemaDiff(old, new *LogEntry) *Diff {
@@ -80,6 +95,31 @@ func ComputeSchemaDiff(old, new *LogEntry) *Diff {
 		tableDiff := computeTableDiff(&oldTable, &newTable)
 		if !tableDiff.IsEmpty() {
 			diff.TablesChanged = append(diff.TablesChanged, *tableDiff)
+		}
+	}
+
+	// Compute type differences
+	newTypeMap := getSchemaTypeMap(&new.Schema)
+	// if a type OID exists in the old schema, but not in the new, remove the type
+	for _, oldType := range old.Schema.Types {
+		if _, found := newTypeMap[oldType.Oid]; !found {
+			diff.TypesRemoved = append(diff.TypesRemoved, oldType)
+		}
+	}
+
+	oldTypeMap := getSchemaTypeMap(&old.Schema)
+	for oid, newType := range newTypeMap {
+		oldType, found := oldTypeMap[oid]
+		// if the type is not on the old schema, add it
+		if !found {
+			diff.TypesAdded = append(diff.TypesAdded, newType)
+			continue
+		}
+
+		// both schemas have the type, check for changes
+		typeDiff := computeTypeDiff(&oldType, &newType)
+		if !typeDiff.IsEmpty() {
+			diff.TypesChanged = append(diff.TypesChanged, *typeDiff)
 		}
 	}
 
@@ -169,4 +209,39 @@ func getTableColumnMap(t *Table) map[string]Column {
 		columnMap[c.PgstreamID] = c
 	}
 	return columnMap
+}
+
+func getSchemaTypeMap(s *Schema) map[string]Type {
+	typeMap := make(map[string]Type, len(s.Types))
+	for _, t := range s.Types {
+		typeMap[t.Oid] = t
+	}
+	return typeMap
+}
+
+func computeTypeDiff(old, new *Type) *TypeDiff {
+	diff := &TypeDiff{
+		TypeName: new.Name,
+		TypeOid:  new.Oid,
+	}
+
+	if old.Name != new.Name {
+		diff.NameChange = &ValueChange[string]{Old: old.Name, New: new.Name}
+	}
+
+	// Find new enum values (values present in new but not in old)
+	if new.Kind == "enum" {
+		oldValueSet := make(map[string]struct{}, len(old.Values))
+		for _, v := range old.Values {
+			oldValueSet[v] = struct{}{}
+		}
+
+		for _, v := range new.Values {
+			if _, found := oldValueSet[v]; !found {
+				diff.ValuesAdded = append(diff.ValuesAdded, v)
+			}
+		}
+	}
+
+	return diff
 }

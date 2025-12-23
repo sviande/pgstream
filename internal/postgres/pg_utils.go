@@ -70,6 +70,10 @@ func QuoteQualifiedIdentifier(schema, table string) string {
 	return QuoteIdentifier(schema) + "." + QuoteIdentifier(table)
 }
 
+func QuoteLiteral(s string) string {
+	return pq.QuoteLiteral(s)
+}
+
 func IsQuotedIdentifier(s string) bool {
 	return len(s) > 2 && strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`)
 }
@@ -115,6 +119,7 @@ func extractDatabase(url string) (string, error) {
 }
 
 func registerTypesToConnMap(ctx context.Context, conn *pgx.Conn) error {
+	// Register hstore type if available
 	var hstoreOID uint32
 	err := conn.QueryRow(ctx, "SELECT oid FROM pg_type WHERE typname = 'hstore'").Scan(&hstoreOID)
 	if err == nil && hstoreOID != 0 {
@@ -125,7 +130,73 @@ func registerTypesToConnMap(ctx context.Context, conn *pgx.Conn) error {
 		})
 	}
 
+	// Register all custom enum types and their arrays
+	if err := registerEnumTypes(ctx, conn); err != nil {
+		return fmt.Errorf("registering enum types: %w", err)
+	}
+
 	return nil
+}
+
+// Query to discover all enum types with their array types
+const discoverEnumTypesQuery = `
+SELECT
+    t.oid AS enum_oid,
+    t.typname AS enum_name,
+    n.nspname AS schema_name,
+    t.typarray AS array_oid
+FROM pg_type t
+JOIN pg_namespace n ON t.typnamespace = n.oid
+WHERE t.typtype = 'e'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY n.nspname, t.typname
+`
+
+func registerEnumTypes(ctx context.Context, conn *pgx.Conn) error {
+	rows, err := conn.Query(ctx, discoverEnumTypesQuery)
+	if err != nil {
+		return fmt.Errorf("querying enum types: %w", err)
+	}
+	defer rows.Close()
+
+	typeMap := conn.TypeMap()
+
+	for rows.Next() {
+		var enumOID, arrayOID uint32
+		var enumName, schemaName string
+		if err := rows.Scan(&enumOID, &enumName, &schemaName, &arrayOID); err != nil {
+			return fmt.Errorf("scanning enum type: %w", err)
+		}
+
+		// Create qualified name for the enum
+		qualifiedName := enumName
+		if schemaName != "public" {
+			qualifiedName = schemaName + "." + enumName
+		}
+
+		// Register the enum type using TextCodec (enums are text-like)
+		enumType := &pgtype.Type{
+			Codec: &pgtype.EnumCodec{},
+			Name:  qualifiedName,
+			OID:   enumOID,
+		}
+		typeMap.RegisterType(enumType)
+
+		// Register the array type for this enum if it exists
+		if arrayOID != 0 {
+			arrayTypeName := "_" + enumName
+			if schemaName != "public" {
+				arrayTypeName = schemaName + "._" + enumName
+			}
+			typeMap.RegisterType(&pgtype.Type{
+				Codec: &pgtype.ArrayCodec{ElementType: enumType},
+				Name:  arrayTypeName,
+				OID:   arrayOID,
+			})
+		}
+	}
+
+	return rows.Err()
 }
 
 const DiscoverAllSchemasQuery = "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pgstream')"

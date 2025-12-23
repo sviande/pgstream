@@ -86,3 +86,9 @@ func (c *Conn) Ping(ctx context.Context) error {
 func (c *Conn) Close(ctx context.Context) error {
 	return MapError(c.conn.Close(ctx))
 }
+
+// RefreshEnumTypes re-registers all custom enum types with the connection's type map.
+// This should be called after executing DDL that creates or modifies enum types.
+func (c *Conn) RefreshEnumTypes(ctx context.Context) error {
+	return registerEnumTypes(ctx, c.conn)
+}

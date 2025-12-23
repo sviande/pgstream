@@ -148,6 +148,10 @@ func (i *Querier) CopyFrom(ctx context.Context, tableName string, columnNames []
 	return i.inner.CopyFrom(ctx, tableName, columnNames, srcRows)
 }
 
+func (i *Querier) RefreshEnumTypes(ctx context.Context) error {
+	return i.inner.RefreshEnumTypes(ctx)
+}
+
 func (i *Querier) initMetrics() error {
 	if i.meter == nil {
 		return nil

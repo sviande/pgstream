@@ -104,6 +104,10 @@ func (q *Querier) Close(ctx context.Context) error {
 	return q.querier.Close(ctx)
 }
 
+func (q *Querier) RefreshEnumTypes(ctx context.Context) error {
+	return q.querier.RefreshEnumTypes(ctx)
+}
+
 func (q *Querier) withRetry(ctx context.Context, operation func() error) error {
 	err := operation()
 	if err == nil || !q.isRetriableError(err) {

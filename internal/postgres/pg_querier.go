@@ -18,6 +18,9 @@ type Querier interface {
 	CopyFrom(ctx context.Context, tableName string, columnNames []string, srcRows [][]any) (int64, error)
 	Ping(ctx context.Context) error
 	Close(ctx context.Context) error
+	// RefreshEnumTypes re-registers all custom enum types with the connection's type map.
+	// This should be called after executing DDL that creates or modifies enum types.
+	RefreshEnumTypes(ctx context.Context) error
 }
 
 type Row interface {
