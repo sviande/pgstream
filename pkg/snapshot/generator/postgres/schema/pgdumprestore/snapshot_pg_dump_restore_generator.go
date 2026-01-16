@@ -44,6 +44,7 @@ type SnapshotGenerator struct {
 	excludeCheckConstraints bool
 	excludeTriggers         bool
 	excludeForeignKeys      bool
+	convertEnumsToText      bool
 	roleSQLParser           *roleSQLParser
 	optionGenerator         *optionGenerator
 	// table renamer for transforming table names in the dump
@@ -79,6 +80,9 @@ type Config struct {
 	ExcludeTriggers bool
 	// ExcludeForeignKeys excludes foreign key constraints from schema snapshot
 	ExcludeForeignKeys bool
+	// ConvertEnumsToText converts all ENUM types to TEXT in the target database.
+	// When enabled, ENUM types will not be created and ENUM columns will be created as TEXT/TEXT[]
+	ConvertEnumsToText bool
 }
 
 type Option func(s *SnapshotGenerator)
@@ -89,6 +93,7 @@ type dump struct {
 	cleanupPart           []byte
 	indicesAndConstraints []byte
 	sequences             []string
+	enumTracker           *enumTypeTracker // Tracks ENUM types for conversion after table renaming
 	roles                 map[string]role
 }
 
@@ -114,6 +119,7 @@ func NewSnapshotGenerator(ctx context.Context, c *Config, opts ...Option) (*Snap
 		excludeCheckConstraints: c.ExcludeCheckConstraints,
 		excludeTriggers:         c.ExcludeTriggers,
 		excludeForeignKeys:      c.ExcludeForeignKeys,
+		convertEnumsToText:      c.ConvertEnumsToText,
 		roleSQLParser:           &roleSQLParser{},
 		optionGenerator:         newOptionGenerator(pglib.ConnBuilder, c),
 	}
@@ -235,7 +241,7 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 	}
 
 	s.logger.Info("restoring schema")
-	if err := s.restoreDump(ctx, dump.filtered); err != nil {
+	if err := s.restoreDump(ctx, dump.filtered, dump.enumTracker); err != nil {
 		return err
 	}
 
@@ -254,7 +260,7 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 	}
 
 	s.logger.Info("restoring schema indices and constraints", loglib.Fields{"schemaTables": ss.SchemaTables})
-	return s.restoreDump(ctx, dump.indicesAndConstraints)
+	return s.restoreDump(ctx, dump.indicesAndConstraints, dump.enumTracker)
 }
 
 func (s *SnapshotGenerator) Close() error {
@@ -372,15 +378,186 @@ func (s *SnapshotGenerator) restoreSchemas(ctx context.Context, schemaTables map
 	return nil
 }
 
-func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte) error {
+// filterDropTypeStatements removes all DROP TYPE statements from the dump.
+// This is necessary when converting ENUMs to TEXT because:
+// 1. The ENUMs are converted to text
+// 2. The DROP TYPE statements would then try to drop "text" (after conversion)
+// 3. This fails because "text" is a system type
+func (s *SnapshotGenerator) filterDropTypeStatements(dump []byte) []byte {
+	scanner := bufio.NewScanner(bytes.NewReader(dump))
+	scanner.Split(bufio.ScanLines)
+	var result strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Skip DROP TYPE statements
+		if strings.HasPrefix(strings.TrimSpace(line), "DROP TYPE") {
+			continue
+		}
+
+		result.WriteString(line)
+		result.WriteString("\n")
+	}
+
+	return []byte(result.String())
+}
+
+// fixRenamedTextType fixes any incorrectly renamed "text" type back to "text".
+// After table renaming, patterns like "schema.text" might become "schema.piana_text",
+// which is incorrect since "text" is a PostgreSQL built-in type.
+func (s *SnapshotGenerator) fixRenamedTextType(dump []byte) []byte {
+	if s.tableRenamer == nil || !s.tableRenamer.HasRules() {
+		return dump
+	}
+
+	result := string(dump)
+
+	// The table renamer might have transformed "text" into various renamed forms
+	// We need to detect and fix these patterns
+	// Common patterns after renaming:
+	// - piana_text -> text
+	// - test_text -> text
+	// - prefix_text -> text
+
+	// Get the renaming pattern by applying it to a dummy "text" identifier
+	// This tells us what prefix is being added
+	dummyRenamed := s.tableRenamer.RenameTable("public", "text")
+
+	if dummyRenamed != "text" {
+		// The table renamer did rename "text", so we need to fix it
+		// Fix all possible quoting combinations
+		// Pattern 1: renamed_text (unquoted)
+		result = strings.ReplaceAll(result, " "+dummyRenamed+" ", " text ")
+		result = strings.ReplaceAll(result, " "+dummyRenamed+",", " text,")
+		result = strings.ReplaceAll(result, " "+dummyRenamed+";", " text;")
+		result = strings.ReplaceAll(result, " "+dummyRenamed+")", " text)")
+		result = strings.ReplaceAll(result, "("+dummyRenamed+" ", "(text ")
+		result = strings.ReplaceAll(result, "("+dummyRenamed+")", "(text)")
+
+		// Pattern 2: "renamed_text" (quoted)
+		result = strings.ReplaceAll(result, `"`+dummyRenamed+`"`, "text")
+
+		// Pattern 3: schema.renamed_text
+		result = strings.ReplaceAll(result, "."+dummyRenamed+" ", ".text ")
+		result = strings.ReplaceAll(result, "."+dummyRenamed+",", ".text,")
+		result = strings.ReplaceAll(result, "."+dummyRenamed+";", ".text;")
+		result = strings.ReplaceAll(result, "."+dummyRenamed+")", ".text)")
+		result = strings.ReplaceAll(result, "."+dummyRenamed+"[]", ".text[]")
+
+		// Pattern 4: schema."renamed_text"
+		result = strings.ReplaceAll(result, `."`+dummyRenamed+`"`, ".text")
+
+		// Pattern 5: "schema"."renamed_text"
+		result = strings.ReplaceAll(result, `"."`+dummyRenamed+`"`, `".text`)
+
+		// Pattern 6: renamed_text[] (array)
+		result = strings.ReplaceAll(result, dummyRenamed+"[]", "text[]")
+		result = strings.ReplaceAll(result, `"`+dummyRenamed+`"[]`, "text[]")
+	}
+
+	return []byte(result)
+}
+
+// convertEnumTypesInDump converts all tracked ENUM types to TEXT in the dump.
+// This is called AFTER table renaming to avoid the renamer accidentally renaming type names.
+func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *enumTypeTracker) []byte {
+	if tracker == nil || len(tracker.types) == 0 {
+		return dump
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(dump))
+	scanner.Split(bufio.ScanLines)
+	var result strings.Builder
+	inCreateTable := false
+	createTableBuffer := strings.Builder{}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Handle CREATE TABLE multi-line statements
+		if inCreateTable {
+			createTableBuffer.WriteString(line)
+			createTableBuffer.WriteString("\n")
+
+			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+				// End of CREATE TABLE - convert ENUMs in the whole statement
+				fullCreateTable := createTableBuffer.String()
+				convertedCreateTable := convertEnumColumnsToText(fullCreateTable, tracker)
+				result.WriteString(convertedCreateTable)
+				inCreateTable = false
+				createTableBuffer.Reset()
+			}
+			continue
+		}
+
+		// Detect start of CREATE TABLE
+		if strings.HasPrefix(line, "CREATE TABLE") {
+			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+				// Single-line CREATE TABLE (rare) - convert directly
+				converted := convertEnumColumnsToText(line+"\n", tracker)
+				result.WriteString(converted)
+			} else {
+				// Multi-line CREATE TABLE (common) - start buffering
+				inCreateTable = true
+				createTableBuffer.WriteString(line)
+				createTableBuffer.WriteString("\n")
+			}
+			continue
+		}
+
+		// Handle ALTER COLUMN TYPE statements (for ENUM conversion)
+		if strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "ALTER COLUMN") && strings.Contains(line, "TYPE") {
+			convertedLine := convertEnumTypeInAlterColumn(line, tracker)
+			result.WriteString(convertedLine)
+			result.WriteString("\n")
+			continue
+		}
+
+		// Convert ENUMs in all other lines (catch-all for type casts, defaults, etc.)
+		// This handles cases like:
+		// - DEFAULT 'value'::enum_type
+		// - Type casts in constraints
+		// - Any other ENUM references
+		convertedLine := convertEnumTypeInLine(line, tracker)
+		result.WriteString(convertedLine)
+		result.WriteString("\n")
+	}
+
+	return []byte(result.String())
+}
+
+func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte, enumTracker ...*enumTypeTracker) error {
 	if len(dump) == 0 {
 		return nil
 	}
+
+	// If ENUM conversion is enabled, remove DROP TYPE statements from the dump
+	// because after conversion they would try to drop "text" which is a system type
+	if s.convertEnumsToText {
+		dump = s.filterDropTypeStatements(dump)
+	}
+
+	// Apply ENUM to TEXT conversion BEFORE table renaming (if configured)
+	// This must happen BEFORE renaming to avoid complex pattern matching issues
+	if s.convertEnumsToText && len(enumTracker) > 0 && enumTracker[0] != nil {
+		// Pre-compute all replacement patterns once for performance
+		// This avoids regenerating patterns for every line in the dump
+		enumTracker[0].computeSortedPatterns()
+		s.logger.Info("converting ENUM types to TEXT", loglib.Fields{"enum_count": len(enumTracker[0].types), "pattern_count": len(enumTracker[0].sortedPatterns)})
+		dump = s.convertEnumTypesInDump(dump, enumTracker[0])
+	}
+
 	// Apply table renaming if configured
 	if s.tableRenamer != nil && s.tableRenamer.HasRules() {
 		s.logger.Info("applying table renaming to schema dump", loglib.Fields{"dump_size": len(dump)})
 		dump = s.tableRenamer.RenameInSQL(dump)
+
+		// IMPORTANT: After table renaming, the word "text" might have been renamed to "piana_text" etc.
+		// We need to fix this since "text" is a PostgreSQL built-in type and should not be renamed
+		dump = s.fixRenamedTextType(dump)
 	}
+
 	_, err := s.pgRestoreFn(ctx, s.optionGenerator.pgrestoreOptions(), dump)
 	pgrestoreErr := &pglib.PGRestoreErrors{}
 	if err != nil {
@@ -492,6 +669,11 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 	// Track CREATE TABLE for multi-line processing and constraint removal
 	inCreateTable := false
 	createTableBuffer := strings.Builder{}
+	// Track ENUM types for conversion to TEXT
+	var enumTracker *enumTypeTracker
+	if s.convertEnumsToText {
+		enumTracker = newEnumTypeTracker()
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -558,6 +740,47 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			indicesAndConstraints.WriteString("\n\n")
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
+		case strings.HasPrefix(line, "CREATE TYPE") && strings.Contains(line, "AS ENUM"):
+			// Handle CREATE TYPE AS ENUM
+			if s.convertEnumsToText && enumTracker != nil {
+				// Extract enum name and track it
+				enumName := extractEnumNameFromCreateType(line)
+				if enumName != "" {
+					enumTracker.add(enumName)
+				}
+				// Skip the entire CREATE TYPE statement (may be multi-line)
+				if !strings.HasSuffix(strings.TrimSpace(line), ";") {
+					// Multi-line ENUM, skip until semicolon
+					for scanner.Scan() {
+						nextLine := scanner.Text()
+						if strings.HasSuffix(strings.TrimSpace(nextLine), ";") {
+							break
+						}
+					}
+				}
+				// Don't write to filtered dump (skip ENUM creation)
+				continue
+			}
+			// If not converting ENUMs, keep the statement
+			filteredDump.WriteString(line)
+			filteredDump.WriteString("\n")
+		case strings.HasPrefix(line, "ALTER TYPE"):
+			// Handle ALTER TYPE statements
+			if s.convertEnumsToText && enumTracker != nil {
+				// Check if it's an ENUM type being altered
+				if strings.Contains(line, "ADD VALUE") || strings.Contains(line, "RENAME VALUE") {
+					// This is ENUM-specific, skip it
+					continue
+				}
+				// ALTER TYPE RENAME TO is not ENUM-specific, but check if it's an ENUM
+				if strings.Contains(line, "RENAME TO") && isAlterTypeForEnum(line, enumTracker) {
+					// Skip renaming ENUM types as they won't exist
+					continue
+				}
+			}
+			// Keep non-ENUM ALTER TYPE or if not converting
+			filteredDump.WriteString(line)
+			filteredDump.WriteString("\n")
 		case strings.HasPrefix(line, "CREATE INDEX"),
 			strings.HasPrefix(line, "CREATE UNIQUE INDEX"),
 			strings.HasPrefix(line, "CREATE CONSTRAINT"),
@@ -582,6 +805,14 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			if !s.shouldExcludeConstraint(line) {
 				indicesAndConstraints.WriteString(line)
 			}
+		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "ALTER COLUMN") && strings.Contains(line, "TYPE"):
+			// Handle ALTER TABLE ... ALTER COLUMN ... TYPE
+			convertedLine := line
+			if s.convertEnumsToText && enumTracker != nil {
+				convertedLine = convertEnumTypeInAlterColumn(line, enumTracker)
+			}
+			filteredDump.WriteString(convertedLine)
+			filteredDump.WriteString("\n")
 		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "REPLICA IDENTITY"):
 			// REPLICA IDENTITY lines should be in the indicesAndConstraints section
 			// since they reference constraints/indices that are also there
@@ -638,6 +869,7 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 		indicesAndConstraints: []byte(indicesAndConstraints.String()),
 		sequences:             sequenceNames,
 		roles:                 dumpRoles,
+		enumTracker:           enumTracker,
 	}
 }
 

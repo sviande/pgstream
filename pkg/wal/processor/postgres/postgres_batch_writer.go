@@ -47,11 +47,12 @@ func NewBatchWriter(ctx context.Context, config *Config, opts ...WriterOption) (
 	}
 
 	adapter, err := newAdapter(ctx, adapterConfig{
-		schemaQuerier:    schemaLogStore,
-		pgURL:            config.URL,
-		onConflictAction: config.OnConflictAction,
-		forCopy:          false,
-		tableFilter:      tableFilter,
+		schemaQuerier:      schemaLogStore,
+		pgURL:              config.URL,
+		onConflictAction:   config.OnConflictAction,
+		forCopy:            false,
+		tableFilter:        tableFilter,
+		convertEnumsToText: config.ConvertEnumsToText,
 	})
 	if err != nil {
 		return nil, err

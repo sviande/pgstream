@@ -481,6 +481,7 @@ func parsePostgresProcessorConfig() *stream.PostgresProcessorConfig {
 			ExcludeCheckConstraints: viper.GetBool("PGSTREAM_POSTGRES_WRITER_EXCLUDE_CHECK_CONSTRAINTS"),
 			ExcludeTriggers:         viper.GetBool("PGSTREAM_POSTGRES_WRITER_EXCLUDE_TRIGGERS"),
 			ExcludeForeignKeys:      viper.GetBool("PGSTREAM_POSTGRES_WRITER_EXCLUDE_FOREIGN_KEYS"),
+			ConvertEnumsToText:      viper.GetBool("PGSTREAM_POSTGRES_WRITER_CONVERT_ENUMS_TO_TEXT"),
 			OnConflictAction:        viper.GetString("PGSTREAM_POSTGRES_WRITER_ON_CONFLICT_ACTION"),
 			BulkIngestEnabled:       bulkIngestEnabled,
 			RetryPolicy:             parseBackoffConfig("PGSTREAM_POSTGRES_WRITER"),

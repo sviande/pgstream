@@ -30,11 +30,12 @@ type adapter struct {
 }
 
 type adapterConfig struct {
-	schemaQuerier    schemalogQuerier
-	pgURL            string
-	onConflictAction string
-	forCopy          bool
-	tableFilter      TableFilter
+	schemaQuerier      schemalogQuerier
+	pgURL              string
+	onConflictAction   string
+	forCopy            bool
+	tableFilter        TableFilter
+	convertEnumsToText bool
 }
 
 func newAdapter(ctx context.Context, cfg adapterConfig) (*adapter, error) {
@@ -53,6 +54,9 @@ func newAdapter(ctx context.Context, cfg adapterConfig) (*adapter, error) {
 		opts := []ddlAdapterOption{}
 		if cfg.tableFilter != nil {
 			opts = append(opts, withTableFilter(cfg.tableFilter))
+		}
+		if cfg.convertEnumsToText {
+			opts = append(opts, withConvertEnumsToText(cfg.convertEnumsToText))
 		}
 		ddl = newDDLAdapter(cfg.schemaQuerier, opts...)
 	}

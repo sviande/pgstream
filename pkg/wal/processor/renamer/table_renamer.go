@@ -213,10 +213,10 @@ func (r *TableRenamer) renameTablesInSQLForRule(sql string, rule compiledRule) s
 // isReservedWord checks if a word is a SQL reserved word that should not be treated as a table name.
 func isReservedWord(word string) bool {
 	reserved := map[string]bool{
-		"pg_catalog": true,
+		"pg_catalog":         true,
 		"information_schema": true,
-		"pg_toast": true,
-		"pg_temp": true,
+		"pg_toast":           true,
+		"pg_temp":            true,
 	}
 	return reserved[strings.ToLower(word)]
 }

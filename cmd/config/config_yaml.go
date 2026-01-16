@@ -172,6 +172,7 @@ type PostgresTargetConfig struct {
 	ExcludeCheckConstraints bool              `mapstructure:"exclude_check_constraints" yaml:"exclude_check_constraints"`
 	ExcludeTriggers         bool              `mapstructure:"exclude_triggers" yaml:"exclude_triggers"`
 	ExcludeForeignKeys      bool              `mapstructure:"exclude_foreign_keys" yaml:"exclude_foreign_keys"`
+	ConvertEnumsToText      bool              `mapstructure:"convert_enums_to_text" yaml:"convert_enums_to_text"`
 }
 
 type KafkaTargetConfig struct {
@@ -591,6 +592,7 @@ func (c *YAMLConfig) parseSchemaSnapshotConfig() (*snapshotbuilder.SchemaSnapsho
 			streamSchemaCfg.DumpRestore.ExcludeCheckConstraints = c.Target.Postgres.ExcludeCheckConstraints
 			streamSchemaCfg.DumpRestore.ExcludeTriggers = c.Target.Postgres.ExcludeTriggers
 			streamSchemaCfg.DumpRestore.ExcludeForeignKeys = c.Target.Postgres.ExcludeForeignKeys
+			streamSchemaCfg.DumpRestore.ConvertEnumsToText = c.Target.Postgres.ConvertEnumsToText
 		}
 
 		return streamSchemaCfg, nil

@@ -30,6 +30,14 @@ type Config struct {
 	ExcludeTriggers bool
 	// ExcludeForeignKeys excludes foreign key constraints from schema sync (snapshot only)
 	ExcludeForeignKeys bool
+	// ConvertEnumsToText converts all ENUM types to TEXT in the target database.
+	// This is useful for compatibility with tools like Metabase that may have issues with custom ENUM types.
+	// When enabled:
+	// - ENUM types will not be created in the target
+	// - ENUM columns will be created as TEXT
+	// - ENUM[] columns will be created as TEXT[]
+	// - ALTER TYPE operations on ENUMs will be ignored
+	ConvertEnumsToText bool
 }
 
 const (

@@ -83,6 +83,7 @@ CREATE TYPE musicbrainz.cover_art_presence AS ENUM (
 );
 
 
+ALTER TYPE musicbrainz.cover_art_presence OWNER TO postgres;
 
 --
 -- Name: edit_note_status; Type: TYPE; Schema: musicbrainz; Owner: postgres
@@ -94,6 +95,7 @@ CREATE TYPE musicbrainz.edit_note_status AS ENUM (
 );
 
 
+ALTER TYPE musicbrainz.edit_note_status OWNER TO postgres;
 
 --
 -- Name: _median(integer[]); Type: FUNCTION; Schema: musicbrainz; Owner: postgres

@@ -75,9 +75,11 @@ type TableFilter interface {
 }
 
 type ddlAdapter struct {
-	schemalogQuerier schemalogQuerier
-	schemaDiffer     schemaDiffer
-	tableFilter      TableFilter
+	schemalogQuerier   schemalogQuerier
+	schemaDiffer       schemaDiffer
+	tableFilter        TableFilter
+	convertEnumsToText bool
+	enumTypeNames      map[string]bool // cache: "type_name" -> true
 }
 
 type schemalogQuerier interface {
@@ -96,6 +98,15 @@ func withTableFilter(filter TableFilter) ddlAdapterOption {
 	}
 }
 
+func withConvertEnumsToText(convert bool) ddlAdapterOption {
+	return func(a *ddlAdapter) {
+		a.convertEnumsToText = convert
+		if convert {
+			a.enumTypeNames = make(map[string]bool)
+		}
+	}
+}
+
 func newDDLAdapter(querier schemalogQuerier, opts ...ddlAdapterOption) *ddlAdapter {
 	adapter := &ddlAdapter{
 		schemalogQuerier: querier,
@@ -108,6 +119,9 @@ func newDDLAdapter(querier schemalogQuerier, opts ...ddlAdapterOption) *ddlAdapt
 }
 
 func (a *ddlAdapter) schemaLogToQueries(ctx context.Context, schemaLog *schemalog.LogEntry) ([]*query, error) {
+	// Update ENUM types cache before processing
+	a.updateEnumTypesCache(schemaLog)
+
 	var previousSchemaLog *schemalog.LogEntry
 	if schemaLog.Version > 0 {
 		var err error
@@ -223,7 +237,19 @@ func (a *ddlAdapter) buildCreateTableQuery(schemaName string, table schemalog.Ta
 }
 
 func (a *ddlAdapter) buildColumnDefinition(column *schemalog.Column) string {
-	colDefinition := fmt.Sprintf("%s %s", pglib.QuoteIdentifier(column.Name), column.DataType)
+	dataType := column.DataType
+
+	// Convert ENUM types to TEXT if enabled
+	if a.isEnumType(dataType) {
+		isArray := strings.HasSuffix(dataType, "[]")
+		if isArray {
+			dataType = "text[]"
+		} else {
+			dataType = "text"
+		}
+	}
+
+	colDefinition := fmt.Sprintf("%s %s", pglib.QuoteIdentifier(column.Name), dataType)
 	if !column.Nullable {
 		colDefinition = fmt.Sprintf("%s NOT NULL", colDefinition)
 	}
@@ -292,10 +318,22 @@ func (a *ddlAdapter) buildAlterColumnQueries(schemaName, tableName string, colum
 	}
 
 	if columnDiff.TypeChange != nil {
+		newType := columnDiff.TypeChange.New
+
+		// Convert ENUM types to TEXT if enabled
+		if a.isEnumType(newType) {
+			isArray := strings.HasSuffix(newType, "[]")
+			if isArray {
+				newType = "text[]"
+			} else {
+				newType = "text"
+			}
+		}
+
 		alterQuery := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s",
 			quotedTableName(schemaName, tableName),
 			pglib.QuoteIdentifier(columnDiff.ColumnName),
-			columnDiff.TypeChange.New,
+			newType,
 		)
 		queries = append(queries, a.newDDLQuery(schemaName, tableName, alterQuery))
 	}
@@ -361,6 +399,11 @@ func (a *ddlAdapter) buildCreateTypeQuery(schemaName string, t schemalog.Type) *
 		return nil
 	}
 
+	// Skip ENUM creation if conversion to text is enabled
+	if a.convertEnumsToText {
+		return nil
+	}
+
 	quotedValues := make([]string, len(t.Values))
 	for i, v := range t.Values {
 		quotedValues[i] = pglib.QuoteLiteral(v)
@@ -389,14 +432,44 @@ func (a *ddlAdapter) buildAlterTypeQueries(schemaName string, typeDiff schemalog
 		queries = append(queries, a.newDDLQuery(schemaName, "", alterQuery))
 	}
 
-	// Add new enum values
-	for _, val := range typeDiff.ValuesAdded {
-		alterQuery := fmt.Sprintf("ALTER TYPE %s ADD VALUE IF NOT EXISTS %s",
-			pglib.QuoteQualifiedIdentifier(schemaName, typeDiff.TypeName),
-			pglib.QuoteLiteral(val),
-		)
-		queries = append(queries, a.newDDLQuery(schemaName, "", alterQuery))
+	// Add new enum values (skip if converting enums to text)
+	if !a.convertEnumsToText {
+		for _, val := range typeDiff.ValuesAdded {
+			alterQuery := fmt.Sprintf("ALTER TYPE %s ADD VALUE IF NOT EXISTS %s",
+				pglib.QuoteQualifiedIdentifier(schemaName, typeDiff.TypeName),
+				pglib.QuoteLiteral(val),
+			)
+			queries = append(queries, a.newDDLQuery(schemaName, "", alterQuery))
+		}
 	}
 
 	return queries
+}
+
+// updateEnumTypesCache updates the cache of ENUM type names from schema log
+func (a *ddlAdapter) updateEnumTypesCache(schemaLog *schemalog.LogEntry) {
+	if !a.convertEnumsToText || schemaLog == nil {
+		return
+	}
+
+	// Clear and rebuild cache
+	a.enumTypeNames = make(map[string]bool)
+	for _, t := range schemaLog.Schema.Types {
+		if t.Kind == "enum" {
+			a.enumTypeNames[t.Name] = true
+		}
+	}
+}
+
+// isEnumType checks if a column type is an ENUM type
+func (a *ddlAdapter) isEnumType(columnType string) bool {
+	if !a.convertEnumsToText {
+		return false
+	}
+
+	// Strip array suffix if present
+	typeName := strings.TrimSuffix(columnType, "[]")
+
+	// Check if it's in our ENUM types cache
+	return a.enumTypeNames[typeName]
 }

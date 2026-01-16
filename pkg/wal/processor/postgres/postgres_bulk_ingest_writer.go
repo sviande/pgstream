@@ -38,11 +38,12 @@ func NewBulkIngestWriter(ctx context.Context, config *Config, opts ...WriterOpti
 	// the bulk ingest writer only processes insert events, so we don't need a
 	// DDL adapter
 	adapter, err := newAdapter(ctx, adapterConfig{
-		schemaQuerier:    nil,
-		pgURL:            config.URL,
-		onConflictAction: config.OnConflictAction,
-		forCopy:          true,
-		tableFilter:      nil,
+		schemaQuerier:      nil,
+		pgURL:              config.URL,
+		onConflictAction:   config.OnConflictAction,
+		forCopy:            true,
+		tableFilter:        nil,
+		convertEnumsToText: config.ConvertEnumsToText,
 	})
 	if err != nil {
 		return nil, err
