@@ -81,7 +81,7 @@ func (o *optionGenerator) pgrestoreOptions() pglib.PGRestoreOptions {
 	}
 }
 
-func (o *optionGenerator) pgdumpOptions(ctx context.Context, schemaTables map[string][]string, excludedTables map[string][]string) (*pglib.PGDumpOptions, error) {
+func (o *optionGenerator) pgdumpOptions(ctx context.Context, schemaTables map[string][]string, excludedTables map[string][]string, excludedViews map[string][]string) (*pglib.PGDumpOptions, error) {
 	schemas := make([]string, 0, len(schemaTables))
 	for schema := range schemaTables {
 		schemas = append(schemas, schema)
@@ -144,6 +144,23 @@ func (o *optionGenerator) pgdumpOptions(ctx context.Context, schemaTables map[st
 				qualifiedTable := pglib.QuoteQualifiedIdentifier(schema, table)
 				if !slices.Contains(opts.ExcludeTables, qualifiedTable) {
 					opts.ExcludeTables = append(opts.ExcludeTables, qualifiedTable)
+				}
+			}
+		}
+	}
+
+	// Exclude specific views (not wildcards) using pg_dump --exclude-table flag.
+	// Note: For wildcard view exclusion (e.g., schema.*), we don't use --exclude-table
+	// because it would exclude all tables too. Instead, views are filtered during
+	// dump parsing in parseDump(). This is handled by passing excludedViews to
+	// the snapshot generator config.
+	for schema, views := range excludedViews {
+		if !hasWildcardTable(views) {
+			// Only add specific view names to exclude, not wildcards
+			for _, view := range views {
+				qualifiedView := pglib.QuoteQualifiedIdentifier(schema, view)
+				if !slices.Contains(opts.ExcludeTables, qualifiedView) {
+					opts.ExcludeTables = append(opts.ExcludeTables, qualifiedView)
 				}
 			}
 		}

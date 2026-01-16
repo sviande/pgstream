@@ -1306,6 +1306,7 @@ func TestSnapshotGenerator_parseDump(t *testing.T) {
 
 	sg := &SnapshotGenerator{
 		excludedSecurityLabels: []string{"anon"},
+		logger:                 log.NewNoopLogger(),
 	}
 	dump := sg.parseDump(dumpBytes)
 
@@ -1551,4 +1552,295 @@ func TestSnapshotGenerator_syncSchemaLog(t *testing.T) {
 			require.ErrorIs(t, err, tc.wantErr)
 		})
 	}
+}
+
+func TestParseDump_ExcludeCheckConstraints(t *testing.T) {
+	t.Parallel()
+
+	dumpInput := []byte(`CREATE TABLE public.users (
+    id integer NOT NULL
+);
+ALTER TABLE public.users ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+ALTER TABLE public.users ADD CONSTRAINT users_age_check CHECK (age > 0);
+ALTER TABLE public.users ADD CONSTRAINT users_email_unique UNIQUE (email);
+`)
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.parseDump(dumpInput)
+
+	require.NotContains(t, string(result.indicesAndConstraints), "users_age_check")
+	require.Contains(t, string(result.indicesAndConstraints), "users_pkey")
+	require.Contains(t, string(result.indicesAndConstraints), "users_email_unique")
+}
+
+func TestParseDump_ExcludeTriggers(t *testing.T) {
+	t.Parallel()
+
+	dumpInput := []byte(`CREATE TRIGGER update_timestamp BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_modified();
+COMMENT ON TRIGGER update_timestamp ON users IS 'Updates timestamp';
+ALTER TABLE public.users ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+CREATE INDEX users_name_idx ON users(name);
+`)
+
+	sg := &SnapshotGenerator{
+		excludeTriggers: true,
+		logger:          log.NewNoopLogger(),
+	}
+
+	result := sg.parseDump(dumpInput)
+
+	require.NotContains(t, string(result.indicesAndConstraints), "CREATE TRIGGER")
+	require.NotContains(t, string(result.indicesAndConstraints), "COMMENT ON TRIGGER")
+	require.Contains(t, string(result.indicesAndConstraints), "users_pkey")
+	require.Contains(t, string(result.indicesAndConstraints), "CREATE INDEX")
+}
+
+func TestParseDump_ExcludeForeignKeys(t *testing.T) {
+	t.Parallel()
+
+	dumpInput := []byte(`ALTER TABLE public.orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES public.users(id);
+ALTER TABLE public.orders ADD CONSTRAINT orders_pkey PRIMARY KEY (id);
+`)
+
+	sg := &SnapshotGenerator{
+		excludeForeignKeys: true,
+		logger:             log.NewNoopLogger(),
+	}
+
+	result := sg.parseDump(dumpInput)
+
+	require.NotContains(t, string(result.indicesAndConstraints), "orders_user_fk")
+	require.NotContains(t, string(result.indicesAndConstraints), "FOREIGN KEY")
+	require.Contains(t, string(result.indicesAndConstraints), "orders_pkey")
+}
+
+func TestParseDump_MultiLineConstraint(t *testing.T) {
+	t.Parallel()
+
+	dumpInput := []byte(`ALTER TABLE public.users
+    ADD CONSTRAINT users_age_check CHECK (age > 0);
+ALTER TABLE public.orders
+    ADD CONSTRAINT orders_pkey PRIMARY KEY (id);
+`)
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.parseDump(dumpInput)
+
+	require.NotContains(t, string(result.indicesAndConstraints), "users_age_check")
+	require.Contains(t, string(result.indicesAndConstraints), "orders_pkey")
+}
+
+func TestCleanCreateTableConstraints_InlineCheckAnonymous(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.users (
+    id integer PRIMARY KEY,
+    age integer CHECK (age > 0),
+    email text UNIQUE
+);`
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	require.NotContains(t, result, "CHECK (age > 0)")
+	require.Contains(t, result, "age integer")
+	require.Contains(t, result, "PRIMARY KEY")
+	require.Contains(t, result, "UNIQUE")
+}
+
+func TestCleanCreateTableConstraints_InlineCheckNamed(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.scores (
+    id integer PRIMARY KEY,
+    score integer CONSTRAINT score_valid CHECK (score >= 0 AND score <= 100)
+);`
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	require.NotContains(t, result, "CONSTRAINT score_valid")
+	require.NotContains(t, result, "CHECK")
+	require.Contains(t, result, "score integer")
+}
+
+func TestCleanCreateTableConstraints_InlineCheckNestedParentheses(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.users (
+    id integer PRIMARY KEY,
+    age integer CHECK ((age > 0) AND (age < 150)),
+    email text UNIQUE
+);`
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	require.NotContains(t, result, "CHECK ((age > 0) AND (age < 150))")
+	require.Contains(t, result, "age integer")
+	require.Contains(t, result, "PRIMARY KEY")
+}
+
+func TestCleanCreateTableConstraints_InlineCheckMultiLine(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.users (
+    id integer PRIMARY KEY,
+    score integer CHECK (
+        score >= 0 AND
+        score <= 100
+    ),
+    email text UNIQUE
+);`
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	require.NotContains(t, result, "CHECK (")
+	require.Contains(t, result, "score integer")
+}
+
+func TestCleanCreateTableConstraints_InlineForeignKey(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.orders (
+    id integer PRIMARY KEY,
+    user_id integer REFERENCES public.users(id),
+    email text UNIQUE
+);`
+
+	sg := &SnapshotGenerator{
+		excludeForeignKeys: true,
+		logger:             log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	require.NotContains(t, result, "REFERENCES")
+	require.Contains(t, result, "user_id integer")
+	require.Contains(t, result, "PRIMARY KEY")
+}
+
+func TestCleanCreateTableConstraints_MixedConstraints(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.complex (
+    id integer PRIMARY KEY,
+    age integer CHECK (age > 0),
+    parent_id integer REFERENCES public.complex(id),
+    email text UNIQUE,
+    score integer CONSTRAINT score_valid CHECK (score >= 0)
+);`
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		excludeForeignKeys:      true,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	require.NotContains(t, result, "CHECK")
+	require.NotContains(t, result, "REFERENCES")
+	require.NotContains(t, result, "CONSTRAINT score_valid")
+	require.Contains(t, result, "age integer")
+	require.Contains(t, result, "parent_id integer")
+	require.Contains(t, result, "PRIMARY KEY")
+	require.Contains(t, result, "UNIQUE")
+}
+
+func TestCleanCreateTableConstraints_NoExclusions(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.users (
+    id integer PRIMARY KEY,
+    age integer CHECK (age > 0),
+    parent_id integer REFERENCES public.users(id)
+);`
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: false,
+		excludeForeignKeys:      false,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	// Should be unchanged
+	require.Equal(t, input, result)
+}
+
+func TestCleanCreateTableConstraints_CheckLastPosition(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.users (
+    id integer,
+    name text,
+    CHECK (id > 0)
+);`
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		excludeForeignKeys:      false,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	// The key requirement: no trailing comma before the closing parenthesis
+	// and valid SQL syntax
+	require.Contains(t, result, "name text")
+	require.NotContains(t, result, "name text,", "should not have trailing comma")
+	require.NotContains(t, result, "CHECK", "CHECK constraint should be removed")
+	require.Contains(t, result, ");", "should have closing parenthesis and semicolon")
+}
+
+func TestCleanCreateTableConstraints_CheckLastPositionNamed(t *testing.T) {
+	t.Parallel()
+
+	input := `CREATE TABLE public.users (
+    id integer,
+    name text,
+    CONSTRAINT positive_id CHECK (id > 0)
+);`
+
+	sg := &SnapshotGenerator{
+		excludeCheckConstraints: true,
+		excludeForeignKeys:      false,
+		logger:                  log.NewNoopLogger(),
+	}
+
+	result := sg.cleanCreateTableConstraints(input)
+
+	// The key requirement: no trailing comma before the closing parenthesis
+	// and valid SQL syntax
+	require.Contains(t, result, "name text")
+	require.NotContains(t, result, "name text,", "should not have trailing comma")
+	require.NotContains(t, result, "CHECK", "CHECK constraint should be removed")
+	require.NotContains(t, result, "CONSTRAINT", "CONSTRAINT keyword should be removed")
+	require.Contains(t, result, ");", "should have closing parenthesis and semicolon")
 }

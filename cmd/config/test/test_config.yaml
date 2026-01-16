@@ -56,6 +56,9 @@ source:
 target:
   postgres:
     url: "postgresql://user:password@localhost:5432/mytargetdatabase"
+    exclude_check_constraints: false
+    exclude_triggers: false
+    exclude_foreign_keys: false
     batch:
       timeout: 1000 # batch timeout in milliseconds
       size: 100 # number of messages in a batch

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -28,19 +29,23 @@ import (
 // SnapshotGenerator generates postgres schema snapshots using pg_dump and
 // pg_restore
 type SnapshotGenerator struct {
-	sourceURL              string
-	targetURL              string
-	pgDumpFn               pglib.PGDumpFn
-	pgDumpAllFn            pglib.PGDumpAllFn
-	pgRestoreFn            pglib.PGRestoreFn
-	schemalogStore         schemalog.Store
-	connBuilder            pglib.QuerierBuilder
-	logger                 loglib.Logger
-	generator              generator.SnapshotGenerator
-	dumpDebugFile          string
-	excludedSecurityLabels []string
-	roleSQLParser          *roleSQLParser
-	optionGenerator        *optionGenerator
+	sourceURL               string
+	targetURL               string
+	pgDumpFn                pglib.PGDumpFn
+	pgDumpAllFn             pglib.PGDumpAllFn
+	pgRestoreFn             pglib.PGRestoreFn
+	schemalogStore          schemalog.Store
+	connBuilder             pglib.QuerierBuilder
+	logger                  loglib.Logger
+	generator               generator.SnapshotGenerator
+	dumpDebugFile           string
+	excludedSecurityLabels  []string
+	excludedViews           map[string][]string
+	excludeCheckConstraints bool
+	excludeTriggers         bool
+	excludeForeignKeys      bool
+	roleSQLParser           *roleSQLParser
+	optionGenerator         *optionGenerator
 	// table renamer for transforming table names in the dump
 	tableRenamer *renamer.TableRenamer
 }
@@ -66,6 +71,14 @@ type Config struct {
 	DumpDebugFile string
 	// if set, security label providers that will be excluded from the dump
 	ExcludedSecurityLabels []string
+	// Views to exclude from the snapshot (filtered during dump parsing for wildcards)
+	ExcludedViews map[string][]string
+	// ExcludeCheckConstraints excludes CHECK constraints from schema snapshot
+	ExcludeCheckConstraints bool
+	// ExcludeTriggers excludes triggers from schema snapshot
+	ExcludeTriggers bool
+	// ExcludeForeignKeys excludes foreign key constraints from schema snapshot
+	ExcludeForeignKeys bool
 }
 
 type Option func(s *SnapshotGenerator)
@@ -88,17 +101,21 @@ const (
 // uses pg_dump and pg_restore to sync the schema of two postgres databases
 func NewSnapshotGenerator(ctx context.Context, c *Config, opts ...Option) (*SnapshotGenerator, error) {
 	sg := &SnapshotGenerator{
-		sourceURL:              c.SourcePGURL,
-		targetURL:              c.TargetPGURL,
-		pgDumpFn:               pglib.RunPGDump,
-		pgDumpAllFn:            pglib.RunPGDumpAll,
-		pgRestoreFn:            pglib.RunPGRestore,
-		connBuilder:            pglib.ConnBuilder,
-		logger:                 loglib.NewNoopLogger(),
-		dumpDebugFile:          c.DumpDebugFile,
-		excludedSecurityLabels: c.ExcludedSecurityLabels,
-		roleSQLParser:          &roleSQLParser{},
-		optionGenerator:        newOptionGenerator(pglib.ConnBuilder, c),
+		sourceURL:               c.SourcePGURL,
+		targetURL:               c.TargetPGURL,
+		pgDumpFn:                pglib.RunPGDump,
+		pgDumpAllFn:             pglib.RunPGDumpAll,
+		pgRestoreFn:             pglib.RunPGRestore,
+		connBuilder:             pglib.ConnBuilder,
+		logger:                  loglib.NewNoopLogger(),
+		dumpDebugFile:           c.DumpDebugFile,
+		excludedSecurityLabels:  c.ExcludedSecurityLabels,
+		excludedViews:           c.ExcludedViews,
+		excludeCheckConstraints: c.ExcludeCheckConstraints,
+		excludeTriggers:         c.ExcludeTriggers,
+		excludeForeignKeys:      c.ExcludeForeignKeys,
+		roleSQLParser:           &roleSQLParser{},
+		optionGenerator:         newOptionGenerator(pglib.ConnBuilder, c),
 	}
 
 	if err := sg.initialiseSchemaLogStore(ctx); err != nil {
@@ -176,7 +193,7 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 
 	// DUMP
 
-	dump, err := s.dumpSchema(ctx, dumpSchemas, ss.SchemaExcludedTables)
+	dump, err := s.dumpSchema(ctx, dumpSchemas, ss.SchemaExcludedTables, ss.SchemaExcludedViews)
 	if err != nil {
 		return err
 	}
@@ -252,8 +269,8 @@ func (s *SnapshotGenerator) Close() error {
 	return nil
 }
 
-func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables map[string][]string, excludedTables map[string][]string) (*dump, error) {
-	pgdumpOpts, err := s.optionGenerator.pgdumpOptions(ctx, schemaTables, excludedTables)
+func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables map[string][]string, excludedTables map[string][]string, excludedViews map[string][]string) (*dump, error) {
+	pgdumpOpts, err := s.optionGenerator.pgdumpOptions(ctx, schemaTables, excludedTables, excludedViews)
 	if err != nil {
 		return nil, fmt.Errorf("preparing pg_dump options: %w", err)
 	}
@@ -472,8 +489,44 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 	sequenceNames := []string{}
 	dumpRoles := make(map[string]role)
 	alterTable := ""
+	// Track CREATE TABLE for multi-line processing and constraint removal
+	inCreateTable := false
+	createTableBuffer := strings.Builder{}
+
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Handle CREATE TABLE multi-line statements
+		if inCreateTable {
+			createTableBuffer.WriteString(line)
+			createTableBuffer.WriteString("\n")
+
+			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+				// End of CREATE TABLE
+				fullCreateTable := createTableBuffer.String()
+				cleanedCreateTable := s.cleanCreateTableConstraints(fullCreateTable)
+				filteredDump.WriteString(cleanedCreateTable)
+				inCreateTable = false
+				createTableBuffer.Reset()
+			}
+			continue
+		}
+
+		// Detect start of CREATE TABLE
+		if strings.HasPrefix(line, "CREATE TABLE") {
+			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+				// Single-line CREATE TABLE (rare)
+				cleanedLine := s.cleanCreateTableConstraints(line + "\n")
+				filteredDump.WriteString(cleanedLine)
+			} else {
+				// Multi-line CREATE TABLE (common)
+				inCreateTable = true
+				createTableBuffer.WriteString(line)
+				createTableBuffer.WriteString("\n")
+			}
+			continue
+		}
+
 		switch {
 		case strings.HasPrefix(line, "SECURITY LABEL") &&
 			isSecurityLabelForExcludedProvider(line, s.excludedSecurityLabels):
@@ -482,10 +535,16 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 		case alterTable != "":
 			// check if the previous alter table line is split in two lines and matches a constraint
 			if strings.Contains(line, "ADD CONSTRAINT") {
-				indicesAndConstraints.WriteString(alterTable)
-				indicesAndConstraints.WriteString("\n")
-				indicesAndConstraints.WriteString(line)
-				indicesAndConstraints.WriteString("\n\n")
+				// Reconstruct full constraint statement for checking
+				fullConstraintLine := alterTable + " " + line
+				if !s.shouldExcludeConstraint(fullConstraintLine) {
+					indicesAndConstraints.WriteString(alterTable)
+					indicesAndConstraints.WriteString("\n")
+					indicesAndConstraints.WriteString(line)
+					indicesAndConstraints.WriteString("\n\n")
+				} else {
+					s.logger.Debug("excluding constraint (multi-line)", loglib.Fields{"constraint": fullConstraintLine})
+				}
 				alterTable = ""
 			} else {
 				filteredDump.WriteString(alterTable)
@@ -502,14 +561,27 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 		case strings.HasPrefix(line, "CREATE INDEX"),
 			strings.HasPrefix(line, "CREATE UNIQUE INDEX"),
 			strings.HasPrefix(line, "CREATE CONSTRAINT"),
-			strings.HasPrefix(line, "CREATE TRIGGER"),
 			strings.HasPrefix(line, "COMMENT ON CONSTRAINT"),
-			strings.HasPrefix(line, "COMMENT ON INDEX"),
-			strings.HasPrefix(line, "COMMENT ON TRIGGER"):
+			strings.HasPrefix(line, "COMMENT ON INDEX"):
 			indicesAndConstraints.WriteString(line)
 			indicesAndConstraints.WriteString("\n\n")
+		case strings.HasPrefix(line, "CREATE TRIGGER"):
+			if !s.excludeTriggers {
+				s.logger.Debug("including trigger", loglib.Fields{"line": line})
+				indicesAndConstraints.WriteString(line)
+				indicesAndConstraints.WriteString("\n\n")
+			} else {
+				s.logger.Debug("excluding trigger", loglib.Fields{"line": line})
+			}
+		case strings.HasPrefix(line, "COMMENT ON TRIGGER"):
+			if !s.excludeTriggers {
+				indicesAndConstraints.WriteString(line)
+				indicesAndConstraints.WriteString("\n\n")
+			}
 		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "ADD CONSTRAINT"):
-			indicesAndConstraints.WriteString(line)
+			if !s.shouldExcludeConstraint(line) {
+				indicesAndConstraints.WriteString(line)
+			}
 		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "REPLICA IDENTITY"):
 			// REPLICA IDENTITY lines should be in the indicesAndConstraints section
 			// since they reference constraints/indices that are also there
@@ -518,6 +590,20 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 		case strings.HasPrefix(line, "ALTER TABLE") && !strings.HasSuffix(line, ";"):
 			// keep it in case the alter table is provided in two lines (pg_dump format)
 			alterTable = line
+		case strings.HasPrefix(line, "CREATE VIEW") || strings.HasPrefix(line, "CREATE OR REPLACE VIEW"):
+			// Filter out views that match excluded_views patterns (wildcards only)
+			if s.shouldExcludeView(line) {
+				// Skip this view and all following lines until we hit a semicolon
+				for scanner.Scan() {
+					viewLine := scanner.Text()
+					if strings.HasSuffix(strings.TrimSpace(viewLine), ";") {
+						break
+					}
+				}
+				continue
+			}
+			filteredDump.WriteString(line)
+			filteredDump.WriteString("\n")
 		case strings.HasPrefix(line, "CREATE SEQUENCE"):
 			qualifiedName, err := pglib.NewQualifiedName(strings.TrimPrefix(line, "CREATE SEQUENCE "))
 			if err == nil {
@@ -659,6 +745,256 @@ func hasWildcardTable(tables []string) bool {
 
 func hasWildcardSchema(schemaTables map[string][]string) bool {
 	return schemaTables[wildcard] != nil
+}
+
+// shouldExcludeView checks if a CREATE VIEW statement should be excluded
+// based on the excluded_views configuration (only wildcards are checked here,
+// specific views are excluded by pg_dump --exclude-table)
+func (s *SnapshotGenerator) shouldExcludeView(line string) bool {
+	if s.excludedViews == nil || len(s.excludedViews) == 0 {
+		return false
+	}
+
+	// Extract view name from "CREATE VIEW schema.viewname" or "CREATE OR REPLACE VIEW schema.viewname"
+	viewPrefix := "CREATE VIEW "
+	if strings.HasPrefix(line, "CREATE OR REPLACE VIEW") {
+		viewPrefix = "CREATE OR REPLACE VIEW "
+	}
+
+	viewNamePart := strings.TrimPrefix(line, viewPrefix)
+	viewNamePart = strings.TrimSpace(viewNamePart)
+	// Extract just the qualified name (before AS or any other clause)
+	if idx := strings.Index(viewNamePart, " "); idx > 0 {
+		viewNamePart = viewNamePart[:idx]
+	}
+
+	qualifiedName, err := pglib.NewQualifiedName(viewNamePart)
+	if err != nil {
+		s.logger.Debug("failed to parse view name from line", loglib.Fields{"line": line, "error": err})
+		return false
+	}
+
+	s.logger.Debug("checking view against excludedViews", loglib.Fields{
+		"view":          qualifiedName.String(),
+		"schema":        qualifiedName.Schema(),
+		"excludedViews": s.excludedViews,
+	})
+
+	// Check if this view matches any wildcard exclusion pattern
+	if views, ok := s.excludedViews[qualifiedName.Schema()]; ok {
+		s.logger.Debug("found schema in excludedViews", loglib.Fields{"schema": qualifiedName.Schema(), "views": views})
+		if hasWildcardTable(views) {
+			// Wildcard exclusion for this schema
+			s.logger.Debug("excluding view due to wildcard match", loglib.Fields{"view": qualifiedName.String()})
+			return true
+		}
+	}
+
+	s.logger.Debug("not excluding view", loglib.Fields{"view": qualifiedName.String()})
+	return false
+}
+
+// shouldExcludeConstraint checks if an ALTER TABLE ADD CONSTRAINT should be excluded
+// based on exclude_check_constraints and exclude_foreign_keys configuration
+func (s *SnapshotGenerator) shouldExcludeConstraint(line string) bool {
+	// Never exclude PRIMARY KEY (critical for replication)
+	if strings.Contains(line, "PRIMARY KEY") {
+		s.logger.Debug("not excluding PRIMARY KEY constraint", loglib.Fields{"line": line})
+		return false
+	}
+
+	// Never exclude UNIQUE constraints (critical for replication)
+	// Note: Check that it's not part of a FOREIGN KEY UNIQUE combo
+	if strings.Contains(line, "UNIQUE") && !strings.Contains(line, "FOREIGN KEY") {
+		s.logger.Debug("not excluding UNIQUE constraint", loglib.Fields{"line": line})
+		return false
+	}
+
+	// Check for CHECK constraints
+	if s.excludeCheckConstraints {
+		if strings.Contains(line, "CHECK (") || strings.Contains(line, "CHECK(") {
+			s.logger.Debug("excluding CHECK constraint", loglib.Fields{"line": line})
+			return true
+		}
+	}
+
+	// Check for FOREIGN KEY constraints
+	if s.excludeForeignKeys {
+		if strings.Contains(line, "FOREIGN KEY") {
+			s.logger.Debug("excluding FOREIGN KEY constraint", loglib.Fields{"line": line})
+			return true
+		}
+	}
+
+	return false
+}
+
+// cleanCreateTableConstraints removes inline constraints from CREATE TABLE statements
+// using a robust parser that handles nested parentheses
+func (s *SnapshotGenerator) cleanCreateTableConstraints(createTableSQL string) string {
+	if !s.excludeCheckConstraints && !s.excludeForeignKeys {
+		return createTableSQL
+	}
+
+	result := createTableSQL
+
+	// Remove inline CHECK constraints (with robust parentheses handling)
+	if s.excludeCheckConstraints {
+		result = s.removeInlineCheckConstraints(result)
+	}
+
+	// Remove inline FOREIGN KEY references (simple pattern, no ON DELETE/UPDATE)
+	if s.excludeForeignKeys {
+		result = s.removeInlineForeignKeys(result)
+	}
+
+	return result
+}
+
+// removeInlineCheckConstraints removes CHECK constraints from CREATE TABLE
+// using a character-by-character parser to handle nested parentheses correctly
+func (s *SnapshotGenerator) removeInlineCheckConstraints(sql string) string {
+	result := strings.Builder{}
+	i := 0
+
+	for i < len(sql) {
+		// Look for "CONSTRAINT name CHECK (" or just "CHECK ("
+		checkIdx := -1
+		isNamed := false
+		constraintStartRelative := -1 // Store where CONSTRAINT starts relative to i
+
+		// Look for anonymous CHECK first
+		anonCheckIdx := strings.Index(strings.ToUpper(sql[i:]), " CHECK ")
+
+		// Look for named CONSTRAINT ... CHECK
+		constraintIdx := strings.Index(strings.ToUpper(sql[i:]), "CONSTRAINT ")
+		var namedCheckIdx int = -1
+		if constraintIdx != -1 {
+			// Check if there's a CHECK after this CONSTRAINT
+			afterConstraint := constraintIdx + 11 // len("CONSTRAINT ")
+			remainingUpper := strings.ToUpper(sql[i+afterConstraint:])
+
+			// Find the constraint name end (next space or CHECK keyword)
+			nameEnd := strings.Index(remainingUpper, " CHECK ")
+			if nameEnd != -1 {
+				namedCheckIdx = i + afterConstraint + nameEnd + 1 // +1 for the space
+				constraintStartRelative = constraintIdx           // Store where CONSTRAINT keyword starts
+			}
+		}
+
+		// Choose whichever comes first: anonymous CHECK or named CONSTRAINT CHECK
+		// Note: anonCheckIdx points to the space before CHECK, so we need to add 1 for comparison
+		if anonCheckIdx != -1 && (namedCheckIdx == -1 || (i+anonCheckIdx+1) < namedCheckIdx) {
+			// Anonymous CHECK comes first (or is the only one)
+			checkIdx = i + anonCheckIdx + 1 // +1 to include the leading space
+			isNamed = false
+		} else if namedCheckIdx != -1 {
+			// Named CONSTRAINT CHECK comes first (or is the only one)
+			checkIdx = namedCheckIdx
+			isNamed = true
+		}
+
+		// No CHECK found, copy the rest and done
+		if checkIdx == -1 {
+			result.WriteString(sql[i:])
+			break
+		}
+
+		// Copy everything before the CHECK (or CONSTRAINT if named)
+		if isNamed && constraintStartRelative != -1 {
+			// Copy up to CONSTRAINT keyword
+			copyUntil := i + constraintStartRelative
+			// Trim trailing space before CONSTRAINT
+			beforeConstraint := sql[i:copyUntil]
+			beforeConstraint = strings.TrimRight(beforeConstraint, " \t")
+			result.WriteString(beforeConstraint)
+			s.logger.Debug("removing inline CHECK constraint (named)", loglib.Fields{"position": checkIdx})
+		} else {
+			result.WriteString(sql[i:checkIdx])
+			s.logger.Debug("removing inline CHECK constraint (anonymous)", loglib.Fields{"position": checkIdx})
+		}
+
+		// Find the opening parenthesis after CHECK
+		checkKeywordEnd := checkIdx + 6 // len(" CHECK")
+		openParenPos := strings.Index(sql[checkKeywordEnd:], "(")
+		if openParenPos == -1 {
+			// Malformed, just skip CHECK keyword and continue
+			result.WriteString(sql[checkIdx:checkKeywordEnd])
+			i = checkKeywordEnd
+			continue
+		}
+
+		// Start parsing from the opening parenthesis
+		startPos := checkKeywordEnd + openParenPos
+		parenCount := 0
+		endPos := startPos
+
+		// Count parentheses to find the matching closing parenthesis
+		for endPos < len(sql) {
+			if sql[endPos] == '(' {
+				parenCount++
+			} else if sql[endPos] == ')' {
+				parenCount--
+				if parenCount == 0 {
+					// Found the matching closing parenthesis
+					endPos++
+					break
+				}
+			}
+			endPos++
+		}
+
+		// Skip past the CHECK constraint (don't write it to result)
+		i = endPos
+
+		// Clean up any trailing comma/space after removed constraint
+		hasCommaAfter := false
+		whitespaceAfter := 0
+		for i < len(sql) && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n') {
+			i++
+			whitespaceAfter++
+		}
+		if i < len(sql) && sql[i] == ',' {
+			hasCommaAfter = true
+			i++ // skip trailing comma
+			// Also skip whitespace after comma
+			for i < len(sql) && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n') {
+				i++
+			}
+		}
+
+		// If no comma after, check if we need to clean a trailing comma before
+		// This handles the case: "col1 INT, CHECK(...)" where we need to remove the comma before CHECK
+		if !hasCommaAfter {
+			// Look back in result to remove trailing comma if present
+			resultStr := result.String()
+			trimmed := strings.TrimRight(resultStr, " \t\n")
+			if strings.HasSuffix(trimmed, ",") {
+				// Remove the trailing comma
+				trimmed = trimmed[:len(trimmed)-1]
+				// Reset result builder with trimmed content
+				result.Reset()
+				result.WriteString(trimmed)
+			}
+		}
+	}
+
+	return result.String()
+}
+
+// removeInlineForeignKeys removes REFERENCES clauses from CREATE TABLE
+// Simple pattern matching - does not handle ON DELETE/ON UPDATE (as per requirement)
+func (s *SnapshotGenerator) removeInlineForeignKeys(sql string) string {
+	// Pattern: REFERENCES table_name(column_name)
+	// Simplified regex for basic REFERENCES without ON DELETE/UPDATE
+	referencesPattern := regexp.MustCompile(`(?i)\s+REFERENCES\s+[a-zA-Z_][a-zA-Z0-9_.]*\s*\([^)]*\)`)
+
+	matches := referencesPattern.FindAllStringIndex(sql, -1)
+	if len(matches) > 0 {
+		s.logger.Debug("removing inline FOREIGN KEY references", loglib.Fields{"count": len(matches)})
+	}
+
+	return referencesPattern.ReplaceAllString(sql, "")
 }
 
 // returns all the lines of d1 that are not in d2

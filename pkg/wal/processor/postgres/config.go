@@ -24,6 +24,12 @@ type Config struct {
 	// ExcludeTables is a list of tables to exclude from DDL replication.
 	// Tables in this list will not have their DDL changes replicated.
 	ExcludeTables []string
+	// ExcludeCheckConstraints excludes CHECK constraints from schema sync (snapshot only)
+	ExcludeCheckConstraints bool
+	// ExcludeTriggers excludes triggers from schema sync (snapshot only)
+	ExcludeTriggers bool
+	// ExcludeForeignKeys excludes foreign key constraints from schema sync (snapshot only)
+	ExcludeForeignKeys bool
 }
 
 const (

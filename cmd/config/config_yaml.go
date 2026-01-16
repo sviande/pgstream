@@ -5,6 +5,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/xataio/pgstream/pkg/backoff"
@@ -77,6 +78,7 @@ type SnapshotConfig struct {
 	Mode            string                  `mapstructure:"mode" yaml:"mode"`
 	Tables          []string                `mapstructure:"tables" yaml:"tables"`
 	ExcludedTables  []string                `mapstructure:"excluded_tables" yaml:"excluded_tables"`
+	ExcludedViews   []string                `mapstructure:"excluded_views" yaml:"excluded_views"`
 	Recorder        *SnapshotRecorderConfig `mapstructure:"recorder" yaml:"recorder"`
 	SnapshotWorkers int                     `mapstructure:"snapshot_workers" yaml:"snapshot_workers"`
 	Data            *SnapshotDataConfig     `mapstructure:"data" yaml:"data"`
@@ -160,13 +162,16 @@ type ConstantBackoffConfig struct {
 }
 
 type PostgresTargetConfig struct {
-	URL               string            `mapstructure:"url" yaml:"url"`
-	Batch             *BatchConfig      `mapstructure:"batch" yaml:"batch"`
-	BulkIngest        *BulkIngestConfig `mapstructure:"bulk_ingest" yaml:"bulk_ingest"`
-	SchemaLogStoreURL string            `mapstructure:"schema_log_store_url" yaml:"schema_log_store_url"`
-	DisableTriggers   bool              `mapstructure:"disable_triggers" yaml:"disable_triggers"`
-	OnConflictAction  string            `mapstructure:"on_conflict_action" yaml:"on_conflict_action"`
-	RetryPolicy       BackoffConfig     `mapstructure:"retry_policy" yaml:"retry_policy"`
+	URL                     string            `mapstructure:"url" yaml:"url"`
+	Batch                   *BatchConfig      `mapstructure:"batch" yaml:"batch"`
+	BulkIngest              *BulkIngestConfig `mapstructure:"bulk_ingest" yaml:"bulk_ingest"`
+	SchemaLogStoreURL       string            `mapstructure:"schema_log_store_url" yaml:"schema_log_store_url"`
+	DisableTriggers         bool              `mapstructure:"disable_triggers" yaml:"disable_triggers"`
+	OnConflictAction        string            `mapstructure:"on_conflict_action" yaml:"on_conflict_action"`
+	RetryPolicy             BackoffConfig     `mapstructure:"retry_policy" yaml:"retry_policy"`
+	ExcludeCheckConstraints bool              `mapstructure:"exclude_check_constraints" yaml:"exclude_check_constraints"`
+	ExcludeTriggers         bool              `mapstructure:"exclude_triggers" yaml:"exclude_triggers"`
+	ExcludeForeignKeys      bool              `mapstructure:"exclude_foreign_keys" yaml:"exclude_foreign_keys"`
 }
 
 type KafkaTargetConfig struct {
@@ -472,6 +477,7 @@ func (c *YAMLConfig) parseSnapshotConfig() (*snapshotbuilder.SnapshotListenerCon
 		Adapter: adapter.SnapshotConfig{
 			Tables:         snapshotConfig.Tables,
 			ExcludedTables: snapshotConfig.ExcludedTables,
+			ExcludedViews:  snapshotConfig.ExcludedViews,
 		},
 	}
 
@@ -557,8 +563,9 @@ func (c *YAMLConfig) parseSchemaSnapshotConfig() (*snapshotbuilder.SchemaSnapsho
 		}
 		streamSchemaCfg := &snapshotbuilder.SchemaSnapshotConfig{
 			DumpRestore: &pgdumprestore.Config{
-				SourcePGURL: c.Source.Postgres.URL,
-				TargetPGURL: c.Target.Postgres.URL,
+				SourcePGURL:   c.Source.Postgres.URL,
+				TargetPGURL:   c.Target.Postgres.URL,
+				ExcludedViews: schemaTableMapHelper(c.Source.Postgres.Snapshot.ExcludedViews),
 			},
 		}
 
@@ -577,6 +584,13 @@ func (c *YAMLConfig) parseSchemaSnapshotConfig() (*snapshotbuilder.SchemaSnapsho
 			if err != nil {
 				return nil, err
 			}
+		}
+
+		// propagate exclude options from target.postgres config
+		if c.Target.Postgres != nil {
+			streamSchemaCfg.DumpRestore.ExcludeCheckConstraints = c.Target.Postgres.ExcludeCheckConstraints
+			streamSchemaCfg.DumpRestore.ExcludeTriggers = c.Target.Postgres.ExcludeTriggers
+			streamSchemaCfg.DumpRestore.ExcludeForeignKeys = c.Target.Postgres.ExcludeForeignKeys
 		}
 
 		return streamSchemaCfg, nil
@@ -650,6 +664,13 @@ func (c *YAMLConfig) parsePostgresProcessorConfig() *stream.PostgresProcessorCon
 		if cfg.BatchWriter.BulkIngestEnabled {
 			applyPostgresBulkBatchDefaults(&cfg.BatchWriter.BatchConfig)
 		}
+	}
+
+	// if there's a filter config, apply it to the postgres processor config
+	// for DDL replication table filtering
+	if c.Modifiers.Filter != nil {
+		cfg.BatchWriter.IncludeTables = c.Modifiers.Filter.IncludeTables
+		cfg.BatchWriter.ExcludeTables = c.Modifiers.Filter.ExcludeTables
 	}
 
 	return cfg
@@ -898,4 +919,26 @@ func (bc *BatchConfig) parseBatchConfig() batch.Config {
 		MaxBatchSize:     int64(bc.Size),
 		IgnoreSendErrors: bc.IgnoreSendErrors,
 	}
+}
+
+// schemaTableMapHelper converts a list of qualified table names (schema.table)
+// into a map of schema -> []table. This duplicates the logic from
+// pkg/wal/listener/snapshot/adapter/config.go:schemaTableMap
+func schemaTableMapHelper(tables []string) map[string][]string {
+	if len(tables) == 0 {
+		return nil
+	}
+	const publicSchema = "public"
+	schemaTableMap := make(map[string][]string, len(tables))
+	for _, table := range tables {
+		schemaName := publicSchema
+		tableName := table
+		tableSplit := strings.Split(table, ".")
+		if len(tableSplit) == 2 {
+			schemaName = tableSplit[0]
+			tableName = tableSplit[1]
+		}
+		schemaTableMap[schemaName] = append(schemaTableMap[schemaName], tableName)
+	}
+	return schemaTableMap
 }
