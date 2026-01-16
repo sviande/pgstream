@@ -23,6 +23,7 @@ import (
 	"github.com/xataio/pgstream/pkg/wal/processor/injector"
 	kafkaprocessor "github.com/xataio/pgstream/pkg/wal/processor/kafka"
 	"github.com/xataio/pgstream/pkg/wal/processor/postgres"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 	"github.com/xataio/pgstream/pkg/wal/processor/search"
 	"github.com/xataio/pgstream/pkg/wal/processor/search/store"
 	"github.com/xataio/pgstream/pkg/wal/processor/transformer"
@@ -236,6 +237,21 @@ type ModifiersConfig struct {
 	Injector        *InjectorConfig        `mapstructure:"injector" yaml:"injector"`
 	Transformations *TransformationsConfig `mapstructure:"transformations" yaml:"transformations"`
 	Filter          *FilterConfig          `mapstructure:"filter" yaml:"filter"`
+	TableRenamer    *TableRenamerConfig    `mapstructure:"table_renamer" yaml:"table_renamer"`
+}
+
+type TableRenamerConfig struct {
+	Rules []TableRenameRuleConfig `mapstructure:"rules" yaml:"rules"`
+}
+
+type TableRenameRuleConfig struct {
+	// Schema filter - only apply to tables in this schema.
+	// Use "*" or empty string to match all schemas.
+	Schema string `mapstructure:"schema" yaml:"schema"`
+	// Match is the regex pattern to match against the table name.
+	Match string `mapstructure:"match" yaml:"match"`
+	// Replace is the replacement string (supports capture groups $1, $2, etc.).
+	Replace string `mapstructure:"replace" yaml:"replace"`
 }
 
 type InjectorConfig struct {
@@ -376,10 +392,11 @@ func (c *YAMLConfig) parseListenerConfig() (stream.ListenerConfig, error) {
 
 func (c *YAMLConfig) parseProcessorConfig() (stream.ProcessorConfig, error) {
 	streamCfg := stream.ProcessorConfig{
-		Kafka:    c.parseKafkaProcessorConfig(),
-		Postgres: c.parsePostgresProcessorConfig(),
-		Webhook:  c.parseWebhookProcessorConfig(),
-		Filter:   c.parseFilterConfig(),
+		Kafka:        c.parseKafkaProcessorConfig(),
+		Postgres:     c.parsePostgresProcessorConfig(),
+		Webhook:      c.parseWebhookProcessorConfig(),
+		Filter:       c.parseFilterConfig(),
+		TableRenamer: c.parseTableRenamerConfig(),
 	}
 
 	var err error
@@ -488,6 +505,16 @@ func (c *YAMLConfig) parseSnapshotConfig() (*snapshotbuilder.SnapshotListenerCon
 		}
 		if streamCfg.Schema == nil {
 			return nil, errSchemaSnapshotNotConfigured
+		}
+	}
+
+	// Create table renamer for snapshot schema if configured
+	renamerCfg := c.parseTableRenamerConfig()
+	if renamerCfg != nil {
+		var err error
+		streamCfg.TableRenamer, err = renamer.NewTableRenamer(renamerCfg)
+		if err != nil {
+			return nil, fmt.Errorf("creating table renamer for snapshot: %w", err)
 		}
 	}
 
@@ -699,6 +726,21 @@ func (c YAMLConfig) parseFilterConfig() *filter.Config {
 		ExcludeTables: c.Modifiers.Filter.ExcludeTables,
 		IncludeTables: c.Modifiers.Filter.IncludeTables,
 	}
+}
+
+func (c YAMLConfig) parseTableRenamerConfig() *renamer.Config {
+	if c.Modifiers.TableRenamer == nil || len(c.Modifiers.TableRenamer.Rules) == 0 {
+		return nil
+	}
+	rules := make([]renamer.Rule, 0, len(c.Modifiers.TableRenamer.Rules))
+	for _, r := range c.Modifiers.TableRenamer.Rules {
+		rules = append(rules, renamer.Rule{
+			Schema:  r.Schema,
+			Match:   r.Match,
+			Replace: r.Replace,
+		})
+	}
+	return &renamer.Config{Rules: rules}
 }
 
 func (c TransformationsConfig) parseTransformationConfig() (*transformer.Config, error) {

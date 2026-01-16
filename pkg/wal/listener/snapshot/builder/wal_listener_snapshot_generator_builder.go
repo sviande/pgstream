@@ -24,6 +24,7 @@ import (
 	"github.com/xataio/pgstream/pkg/wal/listener"
 	listenersnapshot "github.com/xataio/pgstream/pkg/wal/listener/snapshot"
 	"github.com/xataio/pgstream/pkg/wal/listener/snapshot/adapter"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 var errSchemaSnapshotNotConfigured = errors.New("no schema snapshot has been configured")
@@ -79,7 +80,7 @@ func NewSnapshotGenerator(ctx context.Context, cfg *SnapshotListenerConfig, p li
 
 	if cfg.Schema != nil {
 		// postgres schema snapshot generator layer
-		g, err = newSchemaSnapshotGenerator(ctx, cfg.Schema, g, p, logger, instrumentation)
+		g, err = newSchemaSnapshotGenerator(ctx, cfg.Schema, g, p, logger, instrumentation, cfg.TableRenamer)
 		if err != nil {
 			return nil, err
 		}
@@ -108,7 +109,7 @@ func NewSnapshotGenerator(ctx context.Context, cfg *SnapshotListenerConfig, p li
 	return adapter.NewSnapshotGeneratorAdapter(&cfg.Adapter, g, adapter.WithLogger(logger)), nil
 }
 
-func newSchemaSnapshotGenerator(ctx context.Context, cfg *SchemaSnapshotConfig, g generator.SnapshotGenerator, processor listener.Processor, logger loglib.Logger, instrumentation *otel.Instrumentation) (generator.SnapshotGenerator, error) {
+func newSchemaSnapshotGenerator(ctx context.Context, cfg *SchemaSnapshotConfig, g generator.SnapshotGenerator, processor listener.Processor, logger loglib.Logger, instrumentation *otel.Instrumentation, tableRenamer *renamer.TableRenamer) (generator.SnapshotGenerator, error) {
 	switch {
 	case cfg.SchemaLogStore != nil:
 		// postgres schemalog schema snapshot generator
@@ -135,6 +136,9 @@ func newSchemaSnapshotGenerator(ctx context.Context, cfg *SchemaSnapshotConfig, 
 		}
 		if instrumentation.IsEnabled() {
 			opts = append(opts, pgdumprestoregenerator.WithInstrumentation(instrumentation))
+		}
+		if tableRenamer != nil && tableRenamer.HasRules() {
+			opts = append(opts, pgdumprestoregenerator.WithTableRenamer(tableRenamer))
 		}
 		return pgdumprestoregenerator.NewSnapshotGenerator(ctx, cfg.DumpRestore, opts...)
 	default:

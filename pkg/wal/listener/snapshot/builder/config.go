@@ -7,6 +7,7 @@ import (
 	pgsnapshotgenerator "github.com/xataio/pgstream/pkg/snapshot/generator/postgres/data"
 	"github.com/xataio/pgstream/pkg/snapshot/generator/postgres/schema/pgdumprestore"
 	"github.com/xataio/pgstream/pkg/wal/listener/snapshot/adapter"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 type SnapshotListenerConfig struct {
@@ -14,6 +15,8 @@ type SnapshotListenerConfig struct {
 	Adapter  adapter.SnapshotConfig
 	Recorder *SnapshotRecorderConfig
 	Schema   *SchemaSnapshotConfig
+	// TableRenamer is used to transform table names in schema snapshots
+	TableRenamer *renamer.TableRenamer
 }
 
 type SchemaSnapshotConfig struct {

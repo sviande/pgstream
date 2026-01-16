@@ -22,6 +22,7 @@ import (
 	schemalogpg "github.com/xataio/pgstream/pkg/schemalog/postgres"
 	"github.com/xataio/pgstream/pkg/snapshot"
 	"github.com/xataio/pgstream/pkg/snapshot/generator"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 // SnapshotGenerator generates postgres schema snapshots using pg_dump and
@@ -40,6 +41,8 @@ type SnapshotGenerator struct {
 	excludedSecurityLabels []string
 	roleSQLParser          *roleSQLParser
 	optionGenerator        *optionGenerator
+	// table renamer for transforming table names in the dump
+	tableRenamer *renamer.TableRenamer
 }
 
 type Config struct {
@@ -138,6 +141,13 @@ func WithInstrumentation(i *otel.Instrumentation) Option {
 		if sg.schemalogStore != nil {
 			sg.schemalogStore = schemaloginstrumentation.NewStore(sg.schemalogStore, i)
 		}
+	}
+}
+
+// WithTableRenamer sets the table renamer for transforming table names in the SQL dump.
+func WithTableRenamer(tr *renamer.TableRenamer) Option {
+	return func(sg *SnapshotGenerator) {
+		sg.tableRenamer = tr
 	}
 }
 
@@ -348,6 +358,11 @@ func (s *SnapshotGenerator) restoreSchemas(ctx context.Context, schemaTables map
 func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte) error {
 	if len(dump) == 0 {
 		return nil
+	}
+	// Apply table renaming if configured
+	if s.tableRenamer != nil && s.tableRenamer.HasRules() {
+		s.logger.Info("applying table renaming to schema dump", loglib.Fields{"dump_size": len(dump)})
+		dump = s.tableRenamer.RenameInSQL(dump)
 	}
 	_, err := s.pgRestoreFn(ctx, s.optionGenerator.pgrestoreOptions(), dump)
 	pgrestoreErr := &pglib.PGRestoreErrors{}
