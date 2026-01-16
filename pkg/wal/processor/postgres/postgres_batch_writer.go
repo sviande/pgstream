@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strings"
 
 	pglib "github.com/xataio/pgstream/internal/postgres"
 	loglib "github.com/xataio/pgstream/pkg/log"
@@ -40,7 +41,18 @@ func NewBatchWriter(ctx context.Context, config *Config, opts ...WriterOption) (
 		schemaLogStore = schemalog.NewStoreCache(schemaLogStore)
 	}
 
-	adapter, err := newAdapter(ctx, schemaLogStore, config.URL, config.OnConflictAction, false)
+	tableFilter, err := NewSchemaTableFilter(config.IncludeTables, config.ExcludeTables)
+	if err != nil {
+		return nil, fmt.Errorf("create table filter: %w", err)
+	}
+
+	adapter, err := newAdapter(ctx, adapterConfig{
+		schemaQuerier:    schemaLogStore,
+		pgURL:            config.URL,
+		onConflictAction: config.OnConflictAction,
+		forCopy:          false,
+		tableFilter:      tableFilter,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -131,6 +143,13 @@ func (w *BatchWriter) sendBatch(ctx context.Context, batch *batch.Batch[*query])
 				}
 				return err
 			}
+
+			// Refresh enum types after CREATE TYPE or ALTER TYPE DDL
+			if isTypeDDL(q.sql) {
+				if err := w.pgConn.RefreshEnumTypes(ctx); err != nil {
+					w.logger.Warn(err, "failed to refresh enum types after DDL")
+				}
+			}
 		}
 
 		if err := w.flushQueries(ctx, dmlQueries); err != nil {
@@ -219,4 +238,10 @@ func removeIndex(s []*query, index int) []*query {
 	ret := make([]*query, 0)
 	ret = append(ret, s[:index]...)
 	return append(ret, s[index+1:]...)
+}
+
+// isTypeDDL checks if the SQL statement is a CREATE TYPE or ALTER TYPE DDL
+func isTypeDDL(sql string) bool {
+	upperSQL := strings.ToUpper(sql)
+	return strings.HasPrefix(upperSQL, "CREATE TYPE") || strings.HasPrefix(upperSQL, "ALTER TYPE")
 }

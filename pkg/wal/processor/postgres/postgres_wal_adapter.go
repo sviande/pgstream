@@ -29,20 +29,32 @@ type adapter struct {
 	columnObserver columnObserver
 }
 
-func newAdapter(ctx context.Context, schemaQuerier schemalogQuerier, pgURL string, onConflictAction string, forCopy bool) (*adapter, error) {
-	columnObserver, err := newPGColumnObserver(ctx, pgURL)
+type adapterConfig struct {
+	schemaQuerier    schemalogQuerier
+	pgURL            string
+	onConflictAction string
+	forCopy          bool
+	tableFilter      TableFilter
+}
+
+func newAdapter(ctx context.Context, cfg adapterConfig) (*adapter, error) {
+	columnObserver, err := newPGColumnObserver(ctx, cfg.pgURL)
 	if err != nil {
 		return nil, err
 	}
 
-	dmlAdapter, err := newDMLAdapter(onConflictAction, forCopy)
+	dmlAdapter, err := newDMLAdapter(cfg.onConflictAction, cfg.forCopy)
 	if err != nil {
 		return nil, err
 	}
 
 	var ddl *ddlAdapter
-	if schemaQuerier != nil {
-		ddl = newDDLAdapter(schemaQuerier)
+	if cfg.schemaQuerier != nil {
+		opts := []ddlAdapterOption{}
+		if cfg.tableFilter != nil {
+			opts = append(opts, withTableFilter(cfg.tableFilter))
+		}
+		ddl = newDDLAdapter(cfg.schemaQuerier, opts...)
 	}
 	return &adapter{
 		dmlAdapter:      dmlAdapter,
@@ -54,6 +66,13 @@ func newAdapter(ctx context.Context, schemaQuerier schemalogQuerier, pgURL strin
 
 func (a *adapter) walEventToQueries(ctx context.Context, e *wal.Event) ([]*query, error) {
 	if e.Data == nil {
+		return []*query{{}}, nil
+	}
+
+	// Skip DML events from the internal pgstream schema - these should never
+	// be replicated to the target database. Schema log events are still
+	// processed for DDL tracking via IsSchemaLogEvent.
+	if e.Data.Schema == schemalog.SchemaName && !processor.IsSchemaLogEvent(e.Data) {
 		return []*query{{}}, nil
 	}
 

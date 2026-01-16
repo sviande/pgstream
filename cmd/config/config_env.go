@@ -481,6 +481,13 @@ func parsePostgresProcessorConfig() *stream.PostgresProcessorConfig {
 		},
 	}
 
+	// if there's a filter config, apply it to the postgres processor config
+	// for DDL replication table filtering
+	if filterConfig := parseFilterConfig(); filterConfig != nil {
+		cfg.BatchWriter.IncludeTables = filterConfig.IncludeTables
+		cfg.BatchWriter.ExcludeTables = filterConfig.ExcludeTables
+	}
+
 	if bulkIngestEnabled {
 		applyPostgresBulkBatchDefaults(&cfg.BatchWriter.BatchConfig)
 	}

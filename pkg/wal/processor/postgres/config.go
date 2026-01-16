@@ -18,6 +18,12 @@ type Config struct {
 	OnConflictAction  string
 	BulkIngestEnabled bool
 	RetryPolicy       backoff.Config
+	// IncludeTables is a list of tables to include in DDL replication.
+	// If set, only these tables will have their DDL changes replicated.
+	IncludeTables []string
+	// ExcludeTables is a list of tables to exclude from DDL replication.
+	// Tables in this list will not have their DDL changes replicated.
+	ExcludeTables []string
 }
 
 const (

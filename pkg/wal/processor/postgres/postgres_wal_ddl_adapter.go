@@ -14,9 +14,70 @@ import (
 	"github.com/xataio/pgstream/pkg/wal"
 )
 
+// schemaTableFilter implements TableFilter using SchemaTableMap for include/exclude logic
+type schemaTableFilter struct {
+	includeTableMap pglib.SchemaTableMap
+	excludeTableMap pglib.SchemaTableMap
+}
+
+// NewSchemaTableFilter creates a new TableFilter from include/exclude table lists
+func NewSchemaTableFilter(includeTables, excludeTables []string) (TableFilter, error) {
+	if len(includeTables) == 0 && len(excludeTables) == 0 {
+		return nil, nil
+	}
+
+	filter := &schemaTableFilter{}
+	var err error
+
+	if len(includeTables) > 0 {
+		filter.includeTableMap, err = pglib.NewSchemaTableMap(includeTables)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(excludeTables) > 0 {
+		filter.excludeTableMap, err = pglib.NewSchemaTableMap(excludeTables)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return filter, nil
+}
+
+// FilterTables filters tables based on include/exclude configuration
+func (f *schemaTableFilter) FilterTables(schemaName string, tables []schemalog.Table) []schemalog.Table {
+	if len(f.includeTableMap) == 0 && len(f.excludeTableMap) == 0 {
+		return tables
+	}
+
+	filteredTables := make([]schemalog.Table, 0, len(tables))
+	for _, table := range tables {
+		switch {
+		case len(f.includeTableMap) != 0:
+			if f.includeTableMap.ContainsSchemaTable(schemaName, table.Name) {
+				filteredTables = append(filteredTables, table)
+			}
+		case len(f.excludeTableMap) != 0:
+			if !f.excludeTableMap.ContainsSchemaTable(schemaName, table.Name) {
+				filteredTables = append(filteredTables, table)
+			}
+		}
+	}
+
+	return filteredTables
+}
+
+// TableFilter filters tables from a schema based on include/exclude configuration
+type TableFilter interface {
+	FilterTables(schemaName string, tables []schemalog.Table) []schemalog.Table
+}
+
 type ddlAdapter struct {
 	schemalogQuerier schemalogQuerier
 	schemaDiffer     schemaDiffer
+	tableFilter      TableFilter
 }
 
 type schemalogQuerier interface {
@@ -27,11 +88,23 @@ type schemaDiffer func(old, new *schemalog.LogEntry) *schemalog.Diff
 
 type logEntryAdapter func(*wal.Data) (*schemalog.LogEntry, error)
 
-func newDDLAdapter(querier schemalogQuerier) *ddlAdapter {
-	return &ddlAdapter{
+type ddlAdapterOption func(*ddlAdapter)
+
+func withTableFilter(filter TableFilter) ddlAdapterOption {
+	return func(a *ddlAdapter) {
+		a.tableFilter = filter
+	}
+}
+
+func newDDLAdapter(querier schemalogQuerier, opts ...ddlAdapterOption) *ddlAdapter {
+	adapter := &ddlAdapter{
 		schemalogQuerier: querier,
 		schemaDiffer:     schemalog.ComputeSchemaDiff,
 	}
+	for _, opt := range opts {
+		opt(adapter)
+	}
+	return adapter
 }
 
 func (a *ddlAdapter) schemaLogToQueries(ctx context.Context, schemaLog *schemalog.LogEntry) ([]*query, error) {
@@ -41,6 +114,16 @@ func (a *ddlAdapter) schemaLogToQueries(ctx context.Context, schemaLog *schemalo
 		previousSchemaLog, err = a.schemalogQuerier.Fetch(ctx, schemaLog.SchemaName, int(schemaLog.Version)-1)
 		if err != nil && !errors.Is(err, schemalog.ErrNoRows) {
 			return nil, fmt.Errorf("fetching existing schema log entry: %w", err)
+		}
+		// Filter the previous schema log to match the filtering applied to the
+		// current schema log. This ensures that tables excluded via
+		// include/exclude filters are not incorrectly seen as "removed" in the
+		// diff, which would generate DROP TABLE statements for excluded tables.
+		if previousSchemaLog != nil && a.tableFilter != nil {
+			previousSchemaLog.Schema.Tables = a.tableFilter.FilterTables(
+				previousSchemaLog.SchemaName,
+				previousSchemaLog.Schema.Tables,
+			)
 		}
 	}
 
@@ -71,6 +154,20 @@ func (a *ddlAdapter) schemaDiffToQueries(schemaName string, diff *schemalog.Diff
 	}
 
 	queries := []*query{}
+
+	// Handle types BEFORE tables, since tables may depend on types
+	// Create new types first
+	for _, t := range diff.TypesAdded {
+		if q := a.buildCreateTypeQuery(schemaName, t); q != nil {
+			queries = append(queries, q)
+		}
+	}
+
+	// Alter existing types (add new enum values)
+	for _, typeDiff := range diff.TypesChanged {
+		queries = append(queries, a.buildAlterTypeQueries(schemaName, typeDiff)...)
+	}
+
 	for _, table := range diff.TablesRemoved {
 		dropQuery := fmt.Sprintf("DROP TABLE IF EXISTS %s", quotedTableName(schemaName, table.Name))
 		queries = append(queries, a.newDDLQuery(schemaName, table.Name, dropQuery))
@@ -82,6 +179,12 @@ func (a *ddlAdapter) schemaDiffToQueries(schemaName string, diff *schemalog.Diff
 
 	for _, tableDiff := range diff.TablesChanged {
 		queries = append(queries, a.buildAlterTableQueries(schemaName, tableDiff)...)
+	}
+
+	// Drop types AFTER tables, since tables may depend on types
+	for _, t := range diff.TypesRemoved {
+		dropQuery := fmt.Sprintf("DROP TYPE IF EXISTS %s", pglib.QuoteQualifiedIdentifier(schemaName, t.Name))
+		queries = append(queries, a.newDDLQuery(schemaName, "", dropQuery))
 	}
 
 	return queries, nil
@@ -251,4 +354,49 @@ func (a *ddlAdapter) newDDLQuery(schema, table, sql string) *query {
 		sql:    sql,
 		isDDL:  true,
 	}
+}
+
+func (a *ddlAdapter) buildCreateTypeQuery(schemaName string, t schemalog.Type) *query {
+	if t.Kind != "enum" {
+		return nil
+	}
+
+	quotedValues := make([]string, len(t.Values))
+	for i, v := range t.Values {
+		quotedValues[i] = pglib.QuoteLiteral(v)
+	}
+
+	createQuery := fmt.Sprintf("CREATE TYPE %s AS ENUM (%s)",
+		pglib.QuoteQualifiedIdentifier(schemaName, t.Name),
+		strings.Join(quotedValues, ", "),
+	)
+	return a.newDDLQuery(schemaName, "", createQuery)
+}
+
+func (a *ddlAdapter) buildAlterTypeQueries(schemaName string, typeDiff schemalog.TypeDiff) []*query {
+	if typeDiff.IsEmpty() {
+		return []*query{}
+	}
+
+	queries := []*query{}
+
+	// Handle name change
+	if typeDiff.NameChange != nil {
+		alterQuery := fmt.Sprintf("ALTER TYPE %s RENAME TO %s",
+			pglib.QuoteQualifiedIdentifier(schemaName, typeDiff.NameChange.Old),
+			pglib.QuoteIdentifier(typeDiff.NameChange.New),
+		)
+		queries = append(queries, a.newDDLQuery(schemaName, "", alterQuery))
+	}
+
+	// Add new enum values
+	for _, val := range typeDiff.ValuesAdded {
+		alterQuery := fmt.Sprintf("ALTER TYPE %s ADD VALUE IF NOT EXISTS %s",
+			pglib.QuoteQualifiedIdentifier(schemaName, typeDiff.TypeName),
+			pglib.QuoteLiteral(val),
+		)
+		queries = append(queries, a.newDDLQuery(schemaName, "", alterQuery))
+	}
+
+	return queries
 }
