@@ -133,9 +133,18 @@ func (o *optionGenerator) pgdumpOptions(ctx context.Context, schemaTables map[st
 	}
 
 	for schema, tables := range excludedTables {
-		for _, table := range tables {
-			if !slices.Contains(opts.ExcludeTables, pglib.QuoteQualifiedIdentifier(schema, table)) {
-				opts.ExcludeTables = append(opts.ExcludeTables, pglib.QuoteQualifiedIdentifier(schema, table))
+		if hasWildcardTable(tables) {
+			// pg_dump supports patterns like schema.* to exclude all tables from a schema
+			excludePattern := pglib.QuoteIdentifier(schema) + ".*"
+			if !slices.Contains(opts.ExcludeTables, excludePattern) {
+				opts.ExcludeTables = append(opts.ExcludeTables, excludePattern)
+			}
+		} else {
+			for _, table := range tables {
+				qualifiedTable := pglib.QuoteQualifiedIdentifier(schema, table)
+				if !slices.Contains(opts.ExcludeTables, qualifiedTable) {
+					opts.ExcludeTables = append(opts.ExcludeTables, qualifiedTable)
+				}
 			}
 		}
 	}
