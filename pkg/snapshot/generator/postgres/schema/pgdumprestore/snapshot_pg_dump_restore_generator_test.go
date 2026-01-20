@@ -1599,6 +1599,30 @@ CREATE INDEX users_name_idx ON users(name);
 	require.Contains(t, string(result.indicesAndConstraints), "CREATE INDEX")
 }
 
+func TestParseDump_ExcludeConstraintTriggers(t *testing.T) {
+	t.Parallel()
+
+	dumpInput := []byte(`CREATE CONSTRAINT TRIGGER trigger_loan_transaction_upsert_loan_usage AFTER INSERT OR DELETE OR UPDATE ON public."LoanTransaction" DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.trigger_upsert_loan_usage('loanId');
+CREATE TRIGGER trigger_loan_upsert_loan_usage AFTER INSERT OR UPDATE OF amount ON public."Loan" FOR EACH ROW EXECUTE FUNCTION public.trigger_upsert_loan_usage('id');
+ALTER TABLE public.users ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+CREATE INDEX users_name_idx ON users(name);
+`)
+
+	sg := &SnapshotGenerator{
+		excludeTriggers: true,
+		logger:          log.NewNoopLogger(),
+	}
+
+	result := sg.parseDump(dumpInput)
+
+	require.NotContains(t, string(result.indicesAndConstraints), "CREATE TRIGGER")
+	require.NotContains(t, string(result.indicesAndConstraints), "CREATE CONSTRAINT TRIGGER")
+	require.NotContains(t, string(result.indicesAndConstraints), "trigger_loan_transaction_upsert_loan_usage")
+	require.NotContains(t, string(result.indicesAndConstraints), "trigger_loan_upsert_loan_usage")
+	require.Contains(t, string(result.indicesAndConstraints), "users_pkey")
+	require.Contains(t, string(result.indicesAndConstraints), "CREATE INDEX")
+}
+
 func TestParseDump_ExcludeForeignKeys(t *testing.T) {
 	t.Parallel()
 

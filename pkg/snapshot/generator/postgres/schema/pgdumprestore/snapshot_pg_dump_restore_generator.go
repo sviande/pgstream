@@ -781,14 +781,7 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			// Keep non-ENUM ALTER TYPE or if not converting
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
-		case strings.HasPrefix(line, "CREATE INDEX"),
-			strings.HasPrefix(line, "CREATE UNIQUE INDEX"),
-			strings.HasPrefix(line, "CREATE CONSTRAINT"),
-			strings.HasPrefix(line, "COMMENT ON CONSTRAINT"),
-			strings.HasPrefix(line, "COMMENT ON INDEX"):
-			indicesAndConstraints.WriteString(line)
-			indicesAndConstraints.WriteString("\n\n")
-		case strings.HasPrefix(line, "CREATE TRIGGER"):
+		case strings.HasPrefix(line, "CREATE TRIGGER") || strings.HasPrefix(line, "CREATE CONSTRAINT TRIGGER"):
 			if !s.excludeTriggers {
 				s.logger.Debug("including trigger", loglib.Fields{"line": line})
 				indicesAndConstraints.WriteString(line)
@@ -796,6 +789,13 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			} else {
 				s.logger.Debug("excluding trigger", loglib.Fields{"line": line})
 			}
+		case strings.HasPrefix(line, "CREATE INDEX"),
+			strings.HasPrefix(line, "CREATE UNIQUE INDEX"),
+			strings.HasPrefix(line, "CREATE CONSTRAINT"),
+			strings.HasPrefix(line, "COMMENT ON CONSTRAINT"),
+			strings.HasPrefix(line, "COMMENT ON INDEX"):
+			indicesAndConstraints.WriteString(line)
+			indicesAndConstraints.WriteString("\n\n")
 		case strings.HasPrefix(line, "COMMENT ON TRIGGER"):
 			if !s.excludeTriggers {
 				indicesAndConstraints.WriteString(line)
