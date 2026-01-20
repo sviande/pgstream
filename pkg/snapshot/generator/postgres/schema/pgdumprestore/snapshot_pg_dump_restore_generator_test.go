@@ -1321,6 +1321,65 @@ func TestSnapshotGenerator_parseDump(t *testing.T) {
 	require.Equal(t, wantSequences, dump.sequences)
 }
 
+func TestSnapshotGenerator_parseDump_excludeDropSchema(t *testing.T) {
+	t.Parallel()
+
+	dumpWithSchemaStatements := []byte(`\connect test
+
+DROP TABLE IF EXISTS public.users;
+DROP SCHEMA IF EXISTS test_schema;
+CREATE SCHEMA test_schema;
+ALTER SCHEMA test_schema OWNER TO test_role;
+CREATE TABLE public.users (id INT);
+CREATE TABLE test_schema.orders (id INT);
+`)
+
+	tests := []struct {
+		name               string
+		excludeDropSchema  bool
+		wantSchemaInFilter bool
+	}{
+		{
+			name:               "with exclude_drop_schema disabled - keeps schema statements",
+			excludeDropSchema:  false,
+			wantSchemaInFilter: true,
+		},
+		{
+			name:               "with exclude_drop_schema enabled - filters schema statements",
+			excludeDropSchema:  true,
+			wantSchemaInFilter: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sg := &SnapshotGenerator{
+				excludeDropSchema: tc.excludeDropSchema,
+				logger:            log.NewNoopLogger(),
+			}
+			dump := sg.parseDump(dumpWithSchemaStatements)
+
+			filteredStr := string(dump.filtered)
+
+			// Check for DROP SCHEMA
+			hasDropSchema := strings.Contains(filteredStr, "DROP SCHEMA")
+			require.Equal(t, tc.wantSchemaInFilter, hasDropSchema, "DROP SCHEMA should be filtered when exclude_drop_schema is true")
+
+			// Check for CREATE SCHEMA
+			hasCreateSchema := strings.Contains(filteredStr, "CREATE SCHEMA")
+			require.Equal(t, tc.wantSchemaInFilter, hasCreateSchema, "CREATE SCHEMA should be filtered when exclude_drop_schema is true")
+
+			// Check for ALTER SCHEMA OWNER TO
+			hasAlterSchema := strings.Contains(filteredStr, "ALTER SCHEMA") && strings.Contains(filteredStr, "OWNER TO")
+			require.Equal(t, tc.wantSchemaInFilter, hasAlterSchema, "ALTER SCHEMA OWNER TO should be filtered when exclude_drop_schema is true")
+
+			// Tables should always be present
+			require.Contains(t, filteredStr, "CREATE TABLE public.users")
+			require.Contains(t, filteredStr, "CREATE TABLE test_schema.orders")
+		})
+	}
+}
+
 func TestGetDumpsDiff(t *testing.T) {
 	t.Parallel()
 
@@ -1371,6 +1430,121 @@ func TestGetDumpsDiff(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := getDumpsDiff(tc.d1, tc.d2)
+			require.Equal(t, string(tc.want), string(got))
+		})
+	}
+}
+
+func TestFilterDropAndCreateSchema(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input []byte
+		want  []byte
+	}{
+		{
+			name:  "empty input",
+			input: []byte{},
+			want:  []byte{},
+		},
+		{
+			name: "removes DROP SCHEMA IF EXISTS",
+			input: []byte(`DROP TABLE IF EXISTS test_table;
+DROP SCHEMA IF EXISTS test_schema;
+DROP SEQUENCE IF EXISTS test_seq;
+`),
+			want: []byte(`DROP TABLE IF EXISTS test_table;
+DROP SEQUENCE IF EXISTS test_seq;
+`),
+		},
+		{
+			name: "removes CREATE SCHEMA",
+			input: []byte(`DROP TABLE IF EXISTS test_table;
+CREATE SCHEMA test_schema;
+CREATE TABLE test_table (id INT);
+`),
+			want: []byte(`DROP TABLE IF EXISTS test_table;
+CREATE TABLE test_table (id INT);
+`),
+		},
+		{
+			name: "removes ALTER SCHEMA OWNER TO",
+			input: []byte(`CREATE SCHEMA test_schema;
+ALTER SCHEMA test_schema OWNER TO test_role;
+CREATE TABLE test_table (id INT);
+`),
+			want: []byte(`CREATE TABLE test_table (id INT);
+`),
+		},
+		{
+			name: "removes DROP SCHEMA with CASCADE",
+			input: []byte(`DROP SCHEMA IF EXISTS test_schema CASCADE;
+DROP TABLE IF EXISTS test_table;
+`),
+			want: []byte(`DROP TABLE IF EXISTS test_table;
+`),
+		},
+		{
+			name: "handles multiple schemas",
+			input: []byte(`DROP SCHEMA IF EXISTS schema1;
+DROP SCHEMA IF EXISTS schema2;
+CREATE SCHEMA schema1;
+CREATE SCHEMA schema2;
+ALTER SCHEMA schema1 OWNER TO role1;
+ALTER SCHEMA schema2 OWNER TO role2;
+DROP TABLE IF EXISTS test_table;
+`),
+			want: []byte(`DROP TABLE IF EXISTS test_table;
+`),
+		},
+		{
+			name: "preserves other statements",
+			input: []byte(`DROP TABLE IF EXISTS test_table;
+DROP SEQUENCE IF EXISTS test_seq;
+DROP FUNCTION IF EXISTS test_func();
+DROP TYPE IF EXISTS test_type;
+DROP INDEX IF EXISTS test_idx;
+`),
+			want: []byte(`DROP TABLE IF EXISTS test_table;
+DROP SEQUENCE IF EXISTS test_seq;
+DROP FUNCTION IF EXISTS test_func();
+DROP TYPE IF EXISTS test_type;
+DROP INDEX IF EXISTS test_idx;
+`),
+		},
+		{
+			name: "realistic cleanup dump",
+			input: []byte(`\connect test
+
+DROP TABLE IF EXISTS musicbrainz.alternative_medium;
+DROP SCHEMA IF EXISTS musicbrainz;
+CREATE SCHEMA musicbrainz;
+ALTER SCHEMA musicbrainz OWNER TO test_role;
+CREATE TABLE musicbrainz.alternative_medium (id INT);
+`),
+			want: []byte(`\connect test
+
+DROP TABLE IF EXISTS musicbrainz.alternative_medium;
+CREATE TABLE musicbrainz.alternative_medium (id INT);
+`),
+		},
+		{
+			name: "no schema statements to filter",
+			input: []byte(`DROP TABLE IF EXISTS test_table;
+CREATE TABLE test_table (id INT);
+ALTER TABLE test_table ADD COLUMN name TEXT;
+`),
+			want: []byte(`DROP TABLE IF EXISTS test_table;
+CREATE TABLE test_table (id INT);
+ALTER TABLE test_table ADD COLUMN name TEXT;
+`),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterDropAndCreateSchema(tc.input)
 			require.Equal(t, string(tc.want), string(got))
 		})
 	}

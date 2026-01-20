@@ -45,6 +45,7 @@ type SnapshotGenerator struct {
 	excludeTriggers         bool
 	excludeForeignKeys      bool
 	convertEnumsToText      bool
+	excludeDropSchema       bool
 	roleSQLParser           *roleSQLParser
 	optionGenerator         *optionGenerator
 	// table renamer for transforming table names in the dump
@@ -83,6 +84,9 @@ type Config struct {
 	// ConvertEnumsToText converts all ENUM types to TEXT in the target database.
 	// When enabled, ENUM types will not be created and ENUM columns will be created as TEXT/TEXT[]
 	ConvertEnumsToText bool
+	// ExcludeDropSchema excludes DROP SCHEMA and CREATE SCHEMA statements from cleanup
+	// when clean_target_db is enabled. Useful when schemas should already exist in target.
+	ExcludeDropSchema bool
 }
 
 type Option func(s *SnapshotGenerator)
@@ -120,6 +124,7 @@ func NewSnapshotGenerator(ctx context.Context, c *Config, opts ...Option) (*Snap
 		excludeTriggers:         c.ExcludeTriggers,
 		excludeForeignKeys:      c.ExcludeForeignKeys,
 		convertEnumsToText:      c.ConvertEnumsToText,
+		excludeDropSchema:       c.ExcludeDropSchema,
 		roleSQLParser:           &roleSQLParser{},
 		optionGenerator:         newOptionGenerator(pglib.ConnBuilder, c),
 	}
@@ -302,6 +307,12 @@ func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables map[str
 			return nil, fmt.Errorf("dumping schema: %w", err)
 		}
 		parsedDump.cleanupPart = getDumpsDiff(d, dumpWithoutClean)
+
+		// Filter out DROP SCHEMA and CREATE SCHEMA if configured
+		if s.excludeDropSchema {
+			s.logger.Debug("excluding DROP SCHEMA and CREATE SCHEMA from cleanup part")
+			parsedDump.cleanupPart = filterDropAndCreateSchema(parsedDump.cleanupPart)
+		}
 	}
 
 	s.dumpToFile(s.getDumpFileName("-filtered"), pgdumpOpts, parsedDump.filtered)
@@ -842,6 +853,24 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			}
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
+		case strings.HasPrefix(line, "DROP SCHEMA"):
+			// Skip DROP SCHEMA if exclude_drop_schema is enabled, otherwise include it
+			if !s.excludeDropSchema {
+				filteredDump.WriteString(line)
+				filteredDump.WriteString("\n")
+			}
+		case strings.HasPrefix(line, "CREATE SCHEMA"):
+			// Skip CREATE SCHEMA if exclude_drop_schema is enabled, otherwise include it
+			if !s.excludeDropSchema {
+				filteredDump.WriteString(line)
+				filteredDump.WriteString("\n")
+			}
+		case strings.HasPrefix(line, "ALTER SCHEMA") && strings.Contains(line, "OWNER TO"):
+			// Skip ALTER SCHEMA OWNER TO if exclude_drop_schema is enabled, otherwise include it
+			if !s.excludeDropSchema {
+				filteredDump.WriteString(line)
+				filteredDump.WriteString("\n")
+			}
 		case isRoleStatement(line):
 			roles := s.roleSQLParser.extractRoleNamesFromLine(line)
 			if hasExcludedRole(roles) {
@@ -855,7 +884,6 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
-
 		default:
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
@@ -1247,6 +1275,59 @@ func getDumpsDiff(d1, d2 []byte) []byte {
 	}
 
 	return []byte(diff.String())
+}
+
+// filterDropAndCreateSchema removes DROP SCHEMA, CREATE SCHEMA, and ALTER SCHEMA OWNER TO
+// statements from the cleanup dump. This is useful when schemas should already exist in the
+// target database and should not be dropped or recreated.
+func filterDropAndCreateSchema(cleanup []byte) []byte {
+	scanner := bufio.NewScanner(bytes.NewReader(cleanup))
+	scanner.Split(bufio.ScanLines)
+	var filtered strings.Builder
+	skipUntilSemicolon := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmedLine := strings.TrimSpace(line)
+
+		// If we're in the middle of a multi-line statement, continue skipping
+		if skipUntilSemicolon {
+			if strings.HasSuffix(trimmedLine, ";") {
+				skipUntilSemicolon = false
+			}
+			continue
+		}
+
+		// Detect DROP SCHEMA statements (with IF EXISTS and/or CASCADE)
+		if strings.HasPrefix(line, "DROP SCHEMA") {
+			if !strings.HasSuffix(trimmedLine, ";") {
+				skipUntilSemicolon = true
+			}
+			continue
+		}
+
+		// Detect CREATE SCHEMA statements
+		if strings.HasPrefix(line, "CREATE SCHEMA") {
+			if !strings.HasSuffix(trimmedLine, ";") {
+				skipUntilSemicolon = true
+			}
+			continue
+		}
+
+		// Skip ALTER SCHEMA OWNER TO statements (often follows CREATE SCHEMA)
+		if strings.HasPrefix(line, "ALTER SCHEMA") && strings.Contains(line, "OWNER TO") {
+			if !strings.HasSuffix(trimmedLine, ";") {
+				skipUntilSemicolon = true
+			}
+			continue
+		}
+
+		// Keep all other lines
+		filtered.WriteString(line)
+		filtered.WriteString("\n")
+	}
+
+	return []byte(filtered.String())
 }
 
 func isSecurityLabelForExcludedProvider(line string, excludedProviders []string) bool {

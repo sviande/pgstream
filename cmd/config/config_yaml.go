@@ -112,6 +112,7 @@ type PgDumpPgRestoreConfig struct {
 	NoPrivileges           bool     `mapstructure:"no_privileges" yaml:"no_privileges"`
 	DumpFile               string   `mapstructure:"dump_file" yaml:"dump_file"`
 	ExcludedSecurityLabels []string `mapstructure:"excluded_security_labels" yaml:"excluded_security_labels"`
+	ExcludeDropSchema      bool     `mapstructure:"exclude_drop_schema" yaml:"exclude_drop_schema"`
 }
 
 type ReplicationConfig struct {
@@ -579,6 +580,7 @@ func (c *YAMLConfig) parseSchemaSnapshotConfig() (*snapshotbuilder.SchemaSnapsho
 			streamSchemaCfg.DumpRestore.NoPrivileges = schemaSnapshotCfg.PgDumpPgRestore.NoPrivileges
 			streamSchemaCfg.DumpRestore.DumpDebugFile = schemaSnapshotCfg.PgDumpPgRestore.DumpFile
 			streamSchemaCfg.DumpRestore.ExcludedSecurityLabels = schemaSnapshotCfg.PgDumpPgRestore.ExcludedSecurityLabels
+			streamSchemaCfg.DumpRestore.ExcludeDropSchema = schemaSnapshotCfg.PgDumpPgRestore.ExcludeDropSchema
 
 			var err error
 			streamSchemaCfg.DumpRestore.RolesSnapshotMode, err = getRolesSnapshotMode(schemaSnapshotCfg.PgDumpPgRestore.RolesSnapshotMode)
