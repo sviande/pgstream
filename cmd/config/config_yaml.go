@@ -657,9 +657,10 @@ func (c *YAMLConfig) parsePostgresProcessorConfig() *stream.PostgresProcessorCon
 			SchemaLogStore: pgschemalog.Config{
 				URL: c.Target.Postgres.SchemaLogStoreURL,
 			},
-			DisableTriggers:  c.Target.Postgres.DisableTriggers,
-			OnConflictAction: c.Target.Postgres.OnConflictAction,
-			RetryPolicy:      c.Target.Postgres.RetryPolicy.parseBackoffConfig(),
+			DisableTriggers:    c.Target.Postgres.DisableTriggers,
+			OnConflictAction:   c.Target.Postgres.OnConflictAction,
+			RetryPolicy:        c.Target.Postgres.RetryPolicy.parseBackoffConfig(),
+			ConvertEnumsToText: c.Target.Postgres.ConvertEnumsToText,
 		},
 	}
 
