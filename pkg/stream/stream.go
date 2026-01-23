@@ -220,6 +220,16 @@ func addProcessorModifiers(ctx context.Context, config *Config, logger loglib.Lo
 		}
 	}
 
+	if config.Processor.TableRenamer != nil {
+		logger.Info("adding table renaming to processor...")
+		var err error
+		processor, err = renamer.New(processor, config.Processor.TableRenamer,
+			renamer.WithLogger(logger))
+		if err != nil {
+			return nil, nil, fmt.Errorf("error creating table renamer layer: %w", err)
+		}
+	}
+
 	if config.Processor.Injector != nil {
 		logger.Info("adding injection to processor...")
 		opts := []injector.Option{
@@ -231,16 +241,6 @@ func addProcessorModifiers(ctx context.Context, config *Config, logger loglib.Lo
 		processor, err = injector.New(config.Processor.Injector, processor, opts...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("error creating processor injection layer: %w", err)
-		}
-	}
-
-	if config.Processor.TableRenamer != nil {
-		logger.Info("adding table renaming to processor...")
-		var err error
-		processor, err = renamer.New(processor, config.Processor.TableRenamer,
-			renamer.WithLogger(logger))
-		if err != nil {
-			return nil, nil, fmt.Errorf("error creating table renamer layer: %w", err)
 		}
 	}
 
