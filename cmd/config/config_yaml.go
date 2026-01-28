@@ -398,15 +398,19 @@ func (c *YAMLConfig) parseListenerConfig() (stream.ListenerConfig, error) {
 }
 
 func (c *YAMLConfig) parseProcessorConfig() (stream.ProcessorConfig, error) {
+	postgresCfg, err := c.parsePostgresProcessorConfig()
+	if err != nil {
+		return stream.ProcessorConfig{}, err
+	}
+
 	streamCfg := stream.ProcessorConfig{
 		Kafka:        c.parseKafkaProcessorConfig(),
-		Postgres:     c.parsePostgresProcessorConfig(),
+		Postgres:     postgresCfg,
 		Webhook:      c.parseWebhookProcessorConfig(),
 		Filter:       c.parseFilterConfig(),
 		TableRenamer: c.parseTableRenamerConfig(),
 	}
 
-	var err error
 	streamCfg.Injector, err = c.parseInjectorConfig()
 	if err != nil {
 		return stream.ProcessorConfig{}, err
@@ -645,9 +649,9 @@ func (c *YAMLConfig) parseKafkaProcessorConfig() *stream.KafkaProcessorConfig {
 	}
 }
 
-func (c *YAMLConfig) parsePostgresProcessorConfig() *stream.PostgresProcessorConfig {
+func (c *YAMLConfig) parsePostgresProcessorConfig() (*stream.PostgresProcessorConfig, error) {
 	if c.Target.Postgres == nil {
-		return nil
+		return nil, nil
 	}
 
 	cfg := &stream.PostgresProcessorConfig{
@@ -678,7 +682,18 @@ func (c *YAMLConfig) parsePostgresProcessorConfig() *stream.PostgresProcessorCon
 		cfg.BatchWriter.ExcludeTables = c.Modifiers.Filter.ExcludeTables
 	}
 
-	return cfg
+	// if there's a table renamer config, create the renamer and pass it to the
+	// postgres processor for DDL table renaming
+	renamerCfg := c.parseTableRenamerConfig()
+	if renamerCfg != nil {
+		tableRenamer, err := renamer.NewTableRenamer(renamerCfg)
+		if err != nil {
+			return nil, fmt.Errorf("creating table renamer for postgres processor: %w", err)
+		}
+		cfg.BatchWriter.TableRenamer = tableRenamer
+	}
+
+	return cfg, nil
 }
 
 func (c *YAMLConfig) parseSearchProcessorConfig() (*stream.SearchProcessorConfig, error) {

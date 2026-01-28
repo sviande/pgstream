@@ -52,6 +52,7 @@ func NewBatchWriter(ctx context.Context, config *Config, opts ...WriterOption) (
 		onConflictAction:   config.OnConflictAction,
 		forCopy:            false,
 		tableFilter:        tableFilter,
+		tableRenamer:       config.TableRenamer,
 		convertEnumsToText: config.ConvertEnumsToText,
 	})
 	if err != nil {

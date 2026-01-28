@@ -74,10 +74,16 @@ type TableFilter interface {
 	FilterTables(schemaName string, tables []schemalog.Table) []schemalog.Table
 }
 
+// TableRenamer defines the interface for renaming tables
+type TableRenamer interface {
+	RenameTable(schema, table string) string
+}
+
 type ddlAdapter struct {
 	schemalogQuerier   schemalogQuerier
 	schemaDiffer       schemaDiffer
 	tableFilter        TableFilter
+	tableRenamer       TableRenamer
 	convertEnumsToText bool
 	enumTypeNames      map[string]bool // cache: "type_name" -> true
 }
@@ -105,6 +111,25 @@ func withConvertEnumsToText(convert bool) ddlAdapterOption {
 			a.enumTypeNames = make(map[string]bool)
 		}
 	}
+}
+
+func withTableRenamer(renamer TableRenamer) ddlAdapterOption {
+	return func(a *ddlAdapter) {
+		a.tableRenamer = renamer
+	}
+}
+
+// renameTable applies table renaming if a renamer is configured
+func (a *ddlAdapter) renameTable(schema, table string) string {
+	if a.tableRenamer == nil {
+		return table
+	}
+	return a.tableRenamer.RenameTable(schema, table)
+}
+
+// renamedTableName returns the quoted, renamed table name for DDL queries
+func (a *ddlAdapter) renamedTableName(schema, table string) string {
+	return quotedTableName(schema, a.renameTable(schema, table))
 }
 
 func newDDLAdapter(querier schemalogQuerier, opts ...ddlAdapterOption) *ddlAdapter {
@@ -183,7 +208,7 @@ func (a *ddlAdapter) schemaDiffToQueries(schemaName string, diff *schemalog.Diff
 	}
 
 	for _, table := range diff.TablesRemoved {
-		dropQuery := fmt.Sprintf("DROP TABLE IF EXISTS %s", quotedTableName(schemaName, table.Name))
+		dropQuery := fmt.Sprintf("DROP TABLE IF EXISTS %s", a.renamedTableName(schemaName, table.Name))
 		queries = append(queries, a.newDDLQuery(schemaName, table.Name, dropQuery))
 	}
 
@@ -205,7 +230,7 @@ func (a *ddlAdapter) schemaDiffToQueries(schemaName string, diff *schemalog.Diff
 }
 
 func (a *ddlAdapter) buildCreateTableQuery(schemaName string, table schemalog.Table) *query {
-	createQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (", quotedTableName(schemaName, table.Name))
+	createQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (", a.renamedTableName(schemaName, table.Name))
 	uniqueConstraints := make([]string, 0, len(table.Columns))
 	columnDefinitions := make([]string, 0, len(table.Columns))
 	for _, col := range table.Columns {
@@ -278,19 +303,19 @@ func (a *ddlAdapter) buildAlterTableQueries(schemaName string, tableDiff schemal
 	queries := []*query{}
 	if tableDiff.TableNameChange != nil {
 		alterQuery := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
-			quotedTableName(schemaName, tableDiff.TableNameChange.Old),
+			a.renamedTableName(schemaName, tableDiff.TableNameChange.Old),
 			tableDiff.TableNameChange.New,
 		)
 		queries = append(queries, a.newDDLQuery(schemaName, tableDiff.TableName, alterQuery))
 	}
 
 	for _, col := range tableDiff.ColumnsRemoved {
-		alterQuery := fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", quotedTableName(schemaName, tableDiff.TableName), pglib.QuoteIdentifier(col.Name))
+		alterQuery := fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", a.renamedTableName(schemaName, tableDiff.TableName), pglib.QuoteIdentifier(col.Name))
 		queries = append(queries, a.newDDLQuery(schemaName, tableDiff.TableName, alterQuery))
 	}
 
 	for _, col := range tableDiff.ColumnsAdded {
-		alterQuery := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", quotedTableName(schemaName, tableDiff.TableName), a.buildColumnDefinition(&col))
+		alterQuery := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", a.renamedTableName(schemaName, tableDiff.TableName), a.buildColumnDefinition(&col))
 		queries = append(queries, a.newDDLQuery(schemaName, tableDiff.TableName, alterQuery))
 	}
 
@@ -310,7 +335,7 @@ func (a *ddlAdapter) buildAlterColumnQueries(schemaName, tableName string, colum
 	queries := []*query{}
 	if columnDiff.NameChange != nil {
 		alterQuery := fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
-			quotedTableName(schemaName, tableName),
+			a.renamedTableName(schemaName, tableName),
 			pglib.QuoteIdentifier(columnDiff.NameChange.Old),
 			pglib.QuoteIdentifier(columnDiff.NameChange.New),
 		)
@@ -331,7 +356,7 @@ func (a *ddlAdapter) buildAlterColumnQueries(schemaName, tableName string, colum
 		}
 
 		alterQuery := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s",
-			quotedTableName(schemaName, tableName),
+			a.renamedTableName(schemaName, tableName),
 			pglib.QuoteIdentifier(columnDiff.ColumnName),
 			newType,
 		)
@@ -344,13 +369,13 @@ func (a *ddlAdapter) buildAlterColumnQueries(schemaName, tableName string, colum
 		// from not nullable to nullable
 		case columnDiff.NullChange.New:
 			alterQuery = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL",
-				quotedTableName(schemaName, tableName),
+				a.renamedTableName(schemaName, tableName),
 				pglib.QuoteIdentifier(columnDiff.ColumnName),
 			)
 		default:
 			// from nullable to not nullable
 			alterQuery = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL",
-				quotedTableName(schemaName, tableName),
+				a.renamedTableName(schemaName, tableName),
 				pglib.QuoteIdentifier(columnDiff.ColumnName),
 			)
 		}
@@ -363,7 +388,7 @@ func (a *ddlAdapter) buildAlterColumnQueries(schemaName, tableName string, colum
 		// removing the default
 		case nil:
 			alterQuery = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
-				quotedTableName(schemaName, tableName),
+				a.renamedTableName(schemaName, tableName),
 				pglib.QuoteIdentifier(columnDiff.ColumnName),
 			)
 		default:
@@ -371,7 +396,7 @@ func (a *ddlAdapter) buildAlterColumnQueries(schemaName, tableName string, colum
 			// source/target. Keep source database as source of truth.
 			if !strings.Contains(*columnDiff.DefaultChange.New, "seq") {
 				alterQuery = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
-					quotedTableName(schemaName, tableName),
+					a.renamedTableName(schemaName, tableName),
 					pglib.QuoteIdentifier(columnDiff.ColumnName),
 					*columnDiff.DefaultChange.New,
 				)

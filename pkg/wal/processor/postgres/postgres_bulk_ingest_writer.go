@@ -43,6 +43,7 @@ func NewBulkIngestWriter(ctx context.Context, config *Config, opts ...WriterOpti
 		onConflictAction:   config.OnConflictAction,
 		forCopy:            true,
 		tableFilter:        nil,
+		tableRenamer:       config.TableRenamer,
 		convertEnumsToText: config.ConvertEnumsToText,
 	})
 	if err != nil {

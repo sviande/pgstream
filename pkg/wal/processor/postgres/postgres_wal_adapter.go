@@ -35,6 +35,7 @@ type adapterConfig struct {
 	onConflictAction   string
 	forCopy            bool
 	tableFilter        TableFilter
+	tableRenamer       TableRenamer
 	convertEnumsToText bool
 }
 
@@ -54,6 +55,9 @@ func newAdapter(ctx context.Context, cfg adapterConfig) (*adapter, error) {
 		opts := []ddlAdapterOption{}
 		if cfg.tableFilter != nil {
 			opts = append(opts, withTableFilter(cfg.tableFilter))
+		}
+		if cfg.tableRenamer != nil {
+			opts = append(opts, withTableRenamer(cfg.tableRenamer))
 		}
 		if cfg.convertEnumsToText {
 			opts = append(opts, withConvertEnumsToText(cfg.convertEnumsToText))

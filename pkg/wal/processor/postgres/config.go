@@ -38,6 +38,9 @@ type Config struct {
 	// - ENUM[] columns will be created as TEXT[]
 	// - ALTER TYPE operations on ENUMs will be ignored
 	ConvertEnumsToText bool
+	// TableRenamer is used to rename tables in DDL queries.
+	// If set, table names will be transformed using this renamer before generating DDL statements.
+	TableRenamer TableRenamer
 }
 
 const (
