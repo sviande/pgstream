@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	pglib "github.com/xataio/pgstream/internal/postgres"
 )
 
 // enumTypeTracker tracks ENUM types found in the dump
@@ -47,26 +49,7 @@ func (et *enumTypeTracker) add(typeName string) {
 }
 
 func (et *enumTypeTracker) isEnum(typeName string) bool {
-	// Check direct match
-	if et.types[typeName] {
-		return true
-	}
-
-	// Strip quotes and schema qualification for matching
-	cleanName := strings.Trim(typeName, `"`)
-	if et.types[cleanName] {
-		return true
-	}
-
-	// Check without schema prefix
-	parts := strings.Split(cleanName, ".")
-	if len(parts) > 1 {
-		if et.types[parts[len(parts)-1]] {
-			return true
-		}
-	}
-
-	return false
+	return pglib.IsEnumType(typeName, et.types)
 }
 
 // computeSortedPatterns pre-computes all replacement patterns and sorts them by length

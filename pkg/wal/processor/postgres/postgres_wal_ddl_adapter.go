@@ -491,10 +491,5 @@ func (a *ddlAdapter) isEnumType(columnType string) bool {
 	if !a.convertEnumsToText {
 		return false
 	}
-
-	// Strip array suffix if present
-	typeName := strings.TrimSuffix(columnType, "[]")
-
-	// Check if it's in our ENUM types cache
-	return a.enumTypeNames[typeName]
+	return pglib.IsEnumType(columnType, a.enumTypeNames)
 }
