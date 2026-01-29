@@ -20,8 +20,11 @@ type enumTypeTracker struct {
 
 // patternInfo holds a pattern string and its length for efficient sorting
 type patternInfo struct {
-	pattern string
-	length  int
+	pattern            string
+	length             int
+	boundaryRegex      *regexp.Regexp // Pre-compiled regex for non-array type replacement
+	alterTypeArrayRe   *regexp.Regexp // Pre-compiled regex for ALTER COLUMN TYPE array
+	alterTypeSimpleRe  *regexp.Regexp // Pre-compiled regex for ALTER COLUMN TYPE simple
 }
 
 func newEnumTypeTracker() *enumTypeTracker {
@@ -71,26 +74,26 @@ func (et *enumTypeTracker) computeSortedPatterns() {
 			// pg_dump can generate any of these variants
 			allPatterns = append(allPatterns,
 				// Fully quoted
-				patternInfo{`"` + schema + `"."` + typeOnly + `"[]`, len(`"` + schema + `"."` + typeOnly + `"[]`)},
-				patternInfo{`"` + schema + `"."` + typeOnly + `"`, len(`"` + schema + `"."` + typeOnly + `"`)},
+				patternInfo{pattern: `"` + schema + `"."` + typeOnly + `"[]`, length: len(`"` + schema + `"."` + typeOnly + `"[]`)},
+				patternInfo{pattern: `"` + schema + `"."` + typeOnly + `"`, length: len(`"` + schema + `"."` + typeOnly + `"`)},
 				// Schema unquoted, type quoted
-				patternInfo{schema + `."` + typeOnly + `"[]`, len(schema + `."` + typeOnly + `"[]`)},
-				patternInfo{schema + `."` + typeOnly + `"`, len(schema + `."` + typeOnly + `"`)},
+				patternInfo{pattern: schema + `."` + typeOnly + `"[]`, length: len(schema + `."` + typeOnly + `"[]`)},
+				patternInfo{pattern: schema + `."` + typeOnly + `"`, length: len(schema + `."` + typeOnly + `"`)},
 				// Schema quoted, type unquoted
-				patternInfo{`"` + schema + `".` + typeOnly + "[]", len(`"` + schema + `".` + typeOnly + "[]")},
-				patternInfo{`"` + schema + `".` + typeOnly, len(`"` + schema + `".` + typeOnly)},
+				patternInfo{pattern: `"` + schema + `".` + typeOnly + "[]", length: len(`"` + schema + `".` + typeOnly + "[]")},
+				patternInfo{pattern: `"` + schema + `".` + typeOnly, length: len(`"` + schema + `".` + typeOnly)},
 				// Both unquoted
-				patternInfo{schema + "." + typeOnly + "[]", len(schema + "." + typeOnly + "[]")},
-				patternInfo{schema + "." + typeOnly, len(schema + "." + typeOnly)},
+				patternInfo{pattern: schema + "." + typeOnly + "[]", length: len(schema + "." + typeOnly + "[]")},
+				patternInfo{pattern: schema + "." + typeOnly, length: len(schema + "." + typeOnly)},
 			)
 		}
 
 		// Unqualified patterns (no schema) - these are SHORTER, try them LAST
 		allPatterns = append(allPatterns,
-			patternInfo{`"` + typeOnly + `"[]`, len(`"` + typeOnly + `"[]`)},
-			patternInfo{`"` + typeOnly + `"`, len(`"` + typeOnly + `"`)},
-			patternInfo{typeOnly + "[]", len(typeOnly + "[]")},
-			patternInfo{typeOnly, len(typeOnly)},
+			patternInfo{pattern: `"` + typeOnly + `"[]`, length: len(`"` + typeOnly + `"[]`)},
+			patternInfo{pattern: `"` + typeOnly + `"`, length: len(`"` + typeOnly + `"`)},
+			patternInfo{pattern: typeOnly + "[]", length: len(typeOnly + "[]")},
+			patternInfo{pattern: typeOnly, length: len(typeOnly)},
 		)
 	}
 
@@ -99,6 +102,20 @@ func (et *enumTypeTracker) computeSortedPatterns() {
 	sort.Slice(allPatterns, func(i, j int) bool {
 		return allPatterns[i].length > allPatterns[j].length
 	})
+
+	// Pre-compile regexes for all patterns
+	for i := range allPatterns {
+		pattern := allPatterns[i].pattern
+		quotedPattern := regexp.QuoteMeta(pattern)
+
+		if !strings.HasSuffix(pattern, "[]") {
+			// Boundary regex for non-array type replacement in column definitions
+			allPatterns[i].boundaryRegex = regexp.MustCompile(quotedPattern + `(\s|,|;|\)|$)`)
+			// ALTER COLUMN TYPE regexes
+			allPatterns[i].alterTypeArrayRe = regexp.MustCompile(`(?i)(TYPE\s+)` + quotedPattern + `\[\]`)
+			allPatterns[i].alterTypeSimpleRe = regexp.MustCompile(`(?i)(TYPE\s+)` + quotedPattern + `(\s|;|$)`)
+		}
+	}
 
 	et.sortedPatterns = allPatterns
 	et.patternsComputed = true
@@ -248,10 +265,11 @@ func convertEnumTypeInLine(line string, tracker *enumTypeTracker) string {
 			// For array types, do simple string replacement
 			result = strings.ReplaceAll(result, pattern, "text[]")
 		} else {
-			// For non-array types, use regex to ensure we don't replace partial matches
+			// For non-array types, use pre-compiled regex to ensure we don't replace partial matches
 			// Match the pattern followed by a space, comma, semicolon, or end of string
-			regex := regexp.MustCompile(regexp.QuoteMeta(pattern) + `(\s|,|;|\)|$)`)
-			result = regex.ReplaceAllString(result, "text${1}")
+			if p.boundaryRegex != nil {
+				result = p.boundaryRegex.ReplaceAllString(result, "text${1}")
+			}
 		}
 
 		// Also handle type casts like ::schema.type or ::type
@@ -274,28 +292,28 @@ func convertEnumTypeInAlterColumn(alterSQL string, tracker *enumTypeTracker) str
 		return alterSQL
 	}
 
+	// Ensure patterns are computed (done once)
+	if !tracker.patternsComputed {
+		tracker.computeSortedPatterns()
+	}
+
 	// Pattern: ALTER TABLE ... ALTER COLUMN ... TYPE <type>
 	result := alterSQL
 
-	for typeName := range tracker.types {
-		patterns := []struct {
-			pattern     *regexp.Regexp
-			replacement string
-		}{
-			// Array type
-			{
-				regexp.MustCompile(`(?i)(TYPE\s+)` + regexp.QuoteMeta(typeName) + `\[\]`),
-				`${1}text[]`,
-			},
-			// Simple type
-			{
-				regexp.MustCompile(`(?i)(TYPE\s+)` + regexp.QuoteMeta(typeName) + `(\s|;|$)`),
-				`${1}text$2`,
-			},
+	// Use pre-compiled regexes from sorted patterns
+	for _, p := range tracker.sortedPatterns {
+		// Skip array patterns - we handle arrays via the non-array pattern's alterTypeArrayRe
+		if strings.HasSuffix(p.pattern, "[]") {
+			continue
 		}
 
-		for _, p := range patterns {
-			result = p.pattern.ReplaceAllString(result, p.replacement)
+		// Try array type replacement first
+		if p.alterTypeArrayRe != nil {
+			result = p.alterTypeArrayRe.ReplaceAllString(result, `${1}text[]`)
+		}
+		// Then simple type replacement
+		if p.alterTypeSimpleRe != nil {
+			result = p.alterTypeSimpleRe.ReplaceAllString(result, `${1}text$2`)
 		}
 	}
 
