@@ -282,7 +282,13 @@ func (a *ddlAdapter) buildColumnDefinition(column *schemalog.Column) string {
 	// must be aligned between source/target. Keep source database as source of
 	// truth.
 	if column.DefaultValue != nil && !strings.Contains(*column.DefaultValue, "seq") && !column.Generated {
-		colDefinition = fmt.Sprintf("%s DEFAULT %s", colDefinition, *column.DefaultValue)
+		defaultValue := *column.DefaultValue
+		// When converting enums to text, also convert enum type casts in
+		// default values (e.g. 'Pending'::public."MyEnum" -> 'Pending'::text)
+		if a.convertEnumsToText {
+			defaultValue = a.convertEnumCastsInDefault(defaultValue)
+		}
+		colDefinition = fmt.Sprintf("%s DEFAULT %s", colDefinition, defaultValue)
 	}
 
 	return colDefinition
@@ -395,10 +401,14 @@ func (a *ddlAdapter) buildAlterColumnQueries(schemaName, tableName string, colum
 			// do not set default values with sequences since they will differ between
 			// source/target. Keep source database as source of truth.
 			if !strings.Contains(*columnDiff.DefaultChange.New, "seq") {
+				defaultValue := *columnDiff.DefaultChange.New
+				if a.convertEnumsToText {
+					defaultValue = a.convertEnumCastsInDefault(defaultValue)
+				}
 				alterQuery = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
 					a.renamedTableName(schemaName, tableName),
 					pglib.QuoteIdentifier(columnDiff.ColumnName),
-					*columnDiff.DefaultChange.New,
+					defaultValue,
 				)
 			}
 		}
@@ -492,4 +502,76 @@ func (a *ddlAdapter) isEnumType(columnType string) bool {
 		return false
 	}
 	return pglib.IsEnumType(columnType, a.enumTypeNames)
+}
+
+// convertEnumCastsInDefault replaces enum type casts in a DEFAULT value expression
+// with ::text. For example, 'Pending'::public."MyEnum" becomes 'Pending'::text.
+func (a *ddlAdapter) convertEnumCastsInDefault(defaultValue string) string {
+	if len(a.enumTypeNames) == 0 {
+		return defaultValue
+	}
+
+	var result strings.Builder
+	i := 0
+	for i < len(defaultValue) {
+		// Look for :: cast operator
+		if i+1 < len(defaultValue) && defaultValue[i] == ':' && defaultValue[i+1] == ':' {
+			castStart := i
+			i += 2 // skip ::
+
+			// Parse the type identifier after ::
+			typeName, end := parseTypeIdentifier(defaultValue, i)
+			if typeName != "" && pglib.IsEnumType(typeName, a.enumTypeNames) {
+				result.WriteString("::text")
+			} else {
+				result.WriteString(defaultValue[castStart:end])
+			}
+			i = end
+		} else {
+			result.WriteByte(defaultValue[i])
+			i++
+		}
+	}
+
+	return result.String()
+}
+
+// parseTypeIdentifier parses a possibly schema-qualified, possibly quoted
+// type identifier starting at position pos in s. It returns the extracted
+// identifier string and the position after the last consumed character.
+func parseTypeIdentifier(s string, pos int) (string, int) {
+	i := pos
+	var ident strings.Builder
+
+	for i < len(s) {
+		if s[i] == '"' {
+			// Quoted identifier: consume until closing quote
+			ident.WriteByte('"')
+			i++
+			for i < len(s) && s[i] != '"' {
+				ident.WriteByte(s[i])
+				i++
+			}
+			if i < len(s) {
+				ident.WriteByte('"')
+				i++ // skip closing quote
+			}
+		} else if isIdentChar(s[i]) {
+			ident.WriteByte(s[i])
+			i++
+		} else if s[i] == '.' {
+			// Schema separator — only valid between identifiers
+			ident.WriteByte('.')
+			i++
+		} else {
+			break
+		}
+	}
+
+	return ident.String(), i
+}
+
+// isIdentChar returns true if c is a valid unquoted SQL identifier character.
+func isIdentChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }

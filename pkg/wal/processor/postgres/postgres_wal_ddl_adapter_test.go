@@ -479,3 +479,200 @@ func TestDDLAdapter_schemaDiffToQueries(t *testing.T) {
 		})
 	}
 }
+
+func TestDDLAdapter_convertEnumCastsInDefault(t *testing.T) {
+	t.Parallel()
+
+	knownEnums := map[string]bool{
+		"ChorusProSubmissionStatus": true,
+		"MyEnum":                   true,
+	}
+
+	tests := []struct {
+		name     string
+		enums    map[string]bool
+		input    string
+		expected string
+	}{
+		{
+			name:     "schema-qualified quoted enum",
+			enums:    knownEnums,
+			input:    `'Pending'::public."ChorusProSubmissionStatus"`,
+			expected: `'Pending'::text`,
+		},
+		{
+			name:     "schema-qualified unquoted enum",
+			enums:    knownEnums,
+			input:    `'value'::public.MyEnum`,
+			expected: `'value'::text`,
+		},
+		{
+			name:     "quoted enum without schema",
+			enums:    knownEnums,
+			input:    `'value'::"MyEnum"`,
+			expected: `'value'::text`,
+		},
+		{
+			name:     "unquoted enum without schema",
+			enums:    knownEnums,
+			input:    `'value'::MyEnum`,
+			expected: `'value'::text`,
+		},
+		{
+			name:     "fully quoted schema and enum",
+			enums:    knownEnums,
+			input:    `'Pending'::"public"."ChorusProSubmissionStatus"`,
+			expected: `'Pending'::text`,
+		},
+		{
+			name:     "text cast unchanged",
+			enums:    knownEnums,
+			input:    `'IN_DP_E2_CII_FACTURX'::text`,
+			expected: `'IN_DP_E2_CII_FACTURX'::text`,
+		},
+		{
+			name:     "integer cast unchanged",
+			enums:    knownEnums,
+			input:    `'5'::integer`,
+			expected: `'5'::integer`,
+		},
+		{
+			name:     "no cast",
+			enums:    knownEnums,
+			input:    `0`,
+			expected: `0`,
+		},
+		{
+			name:     "empty enum cache",
+			enums:    map[string]bool{},
+			input:    `'Pending'::public."ChorusProSubmissionStatus"`,
+			expected: `'Pending'::public."ChorusProSubmissionStatus"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			a := &ddlAdapter{
+				convertEnumsToText: true,
+				enumTypeNames:      tc.enums,
+			}
+			result := a.convertEnumCastsInDefault(tc.input)
+			require.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestDDLAdapter_schemaDiffToQueries_enumConversion(t *testing.T) {
+	t.Parallel()
+
+	table1 := "test-table-1"
+	defaultEnumVal := `'Pending'::public."ChorusProSubmissionStatus"`
+	defaultIntVal := "0"
+	newDefaultEnumVal := `'Active'::public."ChorusProSubmissionStatus"`
+
+	tests := []struct {
+		name string
+		diff *schemalog.Diff
+
+		wantQueries []*query
+		wantErr     error
+	}{
+		{
+			name: "ok - CREATE TABLE with enum column and default converts cast to text",
+			diff: &schemalog.Diff{
+				TablesAdded: []schemalog.Table{
+					{
+						Name:              table1,
+						PrimaryKeyColumns: []string{"id"},
+						Columns: []schemalog.Column{
+							{Name: "id", DataType: "uuid", Nullable: false, Unique: true},
+							{Name: "status", DataType: `public."ChorusProSubmissionStatus"`, Nullable: false, DefaultValue: &defaultEnumVal},
+						},
+					},
+				},
+			},
+
+			wantQueries: []*query{
+				{
+					schema: testSchema,
+					table:  table1,
+					sql: fmt.Sprintf(
+						"CREATE TABLE IF NOT EXISTS %s (\n\"id\" uuid NOT NULL,\n\"status\" text NOT NULL DEFAULT 'Pending'::text,\nPRIMARY KEY (\"id\")\n)",
+						quotedTableName(testSchema, table1),
+					),
+					isDDL: true,
+				},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "ok - ALTER COLUMN SET DEFAULT with enum cast converts to text",
+			diff: &schemalog.Diff{
+				TablesChanged: []schemalog.TableDiff{
+					{
+						TableName: table1,
+						ColumnsChanged: []schemalog.ColumnDiff{
+							{
+								ColumnName:    "status",
+								DefaultChange: &schemalog.ValueChange[*string]{Old: &defaultEnumVal, New: &newDefaultEnumVal},
+							},
+						},
+					},
+				},
+			},
+
+			wantQueries: []*query{
+				{
+					schema: testSchema,
+					table:  table1,
+					sql:    fmt.Sprintf("ALTER TABLE %s ALTER COLUMN \"status\" SET DEFAULT 'Active'::text", quotedTableName(testSchema, table1)),
+					isDDL:  true,
+				},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "ok - DEFAULT without enum cast unchanged with convertEnumsToText",
+			diff: &schemalog.Diff{
+				TablesChanged: []schemalog.TableDiff{
+					{
+						TableName: table1,
+						ColumnsChanged: []schemalog.ColumnDiff{
+							{
+								ColumnName:    "age",
+								DefaultChange: &schemalog.ValueChange[*string]{Old: nil, New: &defaultIntVal},
+							},
+						},
+					},
+				},
+			},
+
+			wantQueries: []*query{
+				{
+					schema: testSchema,
+					table:  table1,
+					sql:    fmt.Sprintf("ALTER TABLE %s ALTER COLUMN \"age\" SET DEFAULT 0", quotedTableName(testSchema, table1)),
+					isDDL:  true,
+				},
+			},
+			wantErr: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			a := newDDLAdapter(nil, withConvertEnumsToText(true))
+			a.enumTypeNames = map[string]bool{
+				"ChorusProSubmissionStatus": true,
+			}
+
+			queries, err := a.schemaDiffToQueries(testSchema, tc.diff)
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Equal(t, tc.wantQueries, queries)
+		})
+	}
+}
