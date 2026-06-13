@@ -10,7 +10,7 @@ import (
 // TableRenamer renames table identifiers in raw SQL. It is satisfied by
 // renamer.TableRenamer.
 type TableRenamer interface {
-	RenameInSQL(sql string) string
+	RenameInSQL(sql []byte) []byte
 	HasRules() bool
 }
 
@@ -61,18 +61,20 @@ func RewriteDDL(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTrac
 	if convertEnums && tracker != nil && tracker.TypeCount() > 0 {
 		tracker.ComputeSortedPatterns()
 		switch {
-		case strings.HasPrefix(tag, "CREATE TABLE"):
-			sql = ConvertEnumColumnsToText(sql, tracker)
 		case strings.HasPrefix(tag, "ALTER TABLE") && strings.Contains(sql, "ALTER COLUMN") && strings.Contains(sql, "TYPE"):
 			sql = ConvertEnumTypeInAlterColumn(sql, tracker)
 		default:
-			// catch-all: ADD COLUMN enumtype, ::enum casts, DEFAULT ...::enum, etc.
+			// Covers CREATE TABLE, ALTER TABLE ADD COLUMN, casts/defaults, etc.
+			// We use the line-level converter on the whole statement rather than
+			// ConvertEnumColumnsToText: CDC DDL is a single statement (often a
+			// single line), and ConvertEnumColumnsToText skips lines starting with
+			// "CREATE TABLE", which would miss a single-line table definition.
 			sql = ConvertEnumTypeInLine(sql, tracker)
 		}
 	}
 
 	if renamer != nil && renamer.HasRules() {
-		sql = renamer.RenameInSQL(sql)
+		sql = string(renamer.RenameInSQL([]byte(sql)))
 	}
 
 	return sql, false

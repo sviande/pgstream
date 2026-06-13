@@ -18,8 +18,8 @@ func newFakeRenamer() *fakeRenamer {
 }
 
 func (f *fakeRenamer) HasRules() bool { return true }
-func (f *fakeRenamer) RenameInSQL(sql string) string {
-	return f.re.ReplaceAllString(sql, `${1}${2}piana_${3}${4}`)
+func (f *fakeRenamer) RenameInSQL(sql []byte) []byte {
+	return f.re.ReplaceAll(sql, []byte(`${1}${2}piana_${3}${4}`))
 }
 
 func trackerWith(names ...string) *EnumTypeTracker {
@@ -79,6 +79,26 @@ func TestRewriteDDL_CreateTableEnumToTextAndRename(t *testing.T) {
 	}
 	if !strings.Contains(got, "public.piana_users") {
 		t.Errorf("expected table rename to piana_users:\n%s", got)
+	}
+}
+
+func TestRewriteDDL_CreateTableSingleLine(t *testing.T) {
+	// CDC DDL is typically a single line; ConvertEnumColumnsToText would skip the
+	// "CREATE TABLE" line entirely, so the enum must still be converted here.
+	tr := trackerWith("public.color")
+	ddl := "CREATE TABLE public.items (id serial PRIMARY KEY, label text NOT NULL, c public.color NOT NULL DEFAULT 'red', palette public.color[]);"
+	got, skip := RewriteDDL(ddl, "CREATE TABLE", true, tr, newFakeRenamer())
+	if skip {
+		t.Fatalf("unexpected skip")
+	}
+	if strings.Contains(got, "color") {
+		t.Errorf("enum type not converted in single-line CREATE TABLE:\n%s", got)
+	}
+	if !strings.Contains(got, "c text") || !strings.Contains(got, "palette text[]") {
+		t.Errorf("expected text/text[] columns:\n%s", got)
+	}
+	if !strings.Contains(got, "public.piana_items") {
+		t.Errorf("expected table rename:\n%s", got)
 	}
 }
 
