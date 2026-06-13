@@ -35,18 +35,27 @@ type dmlAdapter struct {
 	onConflictAction onConflictAction
 	forCopy          bool
 	pgTypeMap        *pgtype.Map
+	// convertEnumsToText mirrors the DDL adapter: when set, enum-typed primary
+	// key columns are TEXT on the target, so their bulk-delete array cast must be
+	// text[] rather than the (non-existent) source enum array type.
+	convertEnumsToText bool
+	// isEnumType reports whether a source column type is an enum (tracked by the
+	// schema observer). May be nil when enum conversion is disabled.
+	isEnumType func(colType string) bool
 }
 
-func newDMLAdapter(action string, forCopy bool, logger loglib.Logger) (*dmlAdapter, error) {
+func newDMLAdapter(action string, forCopy bool, logger loglib.Logger, convertEnumsToText bool, isEnumType func(string) bool) (*dmlAdapter, error) {
 	oca, err := parseOnConflictAction(action)
 	if err != nil {
 		return nil, err
 	}
 	return &dmlAdapter{
-		logger:           logger,
-		onConflictAction: oca,
-		forCopy:          forCopy,
-		pgTypeMap:        pgtype.NewMap(),
+		logger:             logger,
+		onConflictAction:   oca,
+		forCopy:            forCopy,
+		pgTypeMap:          pgtype.NewMap(),
+		convertEnumsToText: convertEnumsToText,
+		isEnumType:         isEnumType,
 	}, nil
 }
 

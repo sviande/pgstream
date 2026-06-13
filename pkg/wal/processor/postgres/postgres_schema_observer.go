@@ -116,6 +116,14 @@ func (o *pgSchemaObserver) bootstrapEnumTypes(ctx context.Context, sourceURL str
 	return nil
 }
 
+// isEnumType reports whether the given (source) column type is a tracked enum.
+// It is safe for concurrent use.
+func (o *pgSchemaObserver) isEnumType(colType string) bool {
+	o.enumMu.Lock()
+	defer o.enumMu.Unlock()
+	return o.enumTracker.IsEnum(colType)
+}
+
 // RewriteDDL rewrites a raw replicated DDL statement for the target (ENUM->TEXT
 // + table renaming), returning skip=true when it must not be applied. It is
 // safe for concurrent use.

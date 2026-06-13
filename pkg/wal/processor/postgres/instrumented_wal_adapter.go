@@ -41,6 +41,10 @@ func (i *instrumentedWalAdapter) walEventToMessage(ctx context.Context, event *w
 	return i.inner.walEventToMessage(ctx, event)
 }
 
+func (i *instrumentedWalAdapter) isEnumType(colType string) bool {
+	return i.inner.isEnumType(colType)
+}
+
 func (i *instrumentedWalAdapter) close() error {
 	return i.inner.close()
 }

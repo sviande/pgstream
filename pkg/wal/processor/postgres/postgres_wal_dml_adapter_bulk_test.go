@@ -367,7 +367,7 @@ func TestBuildBulkInsertQueries_WithGeneratedColumns(t *testing.T) {
 func TestBuildBulkInsertQueries_OnConflictUpdate(t *testing.T) {
 	t.Parallel()
 
-	a, err := newDMLAdapter("update", false, loglib.NewNoopLogger())
+	a, err := newDMLAdapter("update", false, loglib.NewNoopLogger(), false, nil)
 	require.NoError(t, err)
 
 	si := schemaInfo{
@@ -444,7 +444,7 @@ func deleteEvent(schema, table, colName, colType string, colValue any) *wal.Data
 
 func newTestDMLAdapter(t *testing.T) *dmlAdapter {
 	t.Helper()
-	a, err := newDMLAdapter("", false, loglib.NewNoopLogger())
+	a, err := newDMLAdapter("", false, loglib.NewNoopLogger(), false, nil)
 	require.NoError(t, err)
 	return a
 }

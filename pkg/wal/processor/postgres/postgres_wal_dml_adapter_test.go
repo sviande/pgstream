@@ -948,7 +948,7 @@ func Test_newDMLAdapter(t *testing.T) {
 		t.Run(tc.action, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := newDMLAdapter(tc.action, false, log.NewNoopLogger())
+			_, err := newDMLAdapter(tc.action, false, log.NewNoopLogger(), false, nil)
 			require.ErrorIs(t, err, tc.wantErr)
 		})
 	}

@@ -24,6 +24,10 @@ func (m *mockAdapter) walEventToMessage(_ context.Context, e *wal.Event) (*walMe
 	return &walMessage{}, nil
 }
 
+func (m *mockAdapter) isEnumType(string) bool {
+	return false
+}
+
 func (m *mockAdapter) close() error {
 	return nil
 }
@@ -54,6 +58,10 @@ func (m *mockSchemaObserver) getSequenceColumns(ctx context.Context, schema, tab
 
 func (m *mockSchemaObserver) isMaterializedView(ctx context.Context, schema, table string) bool {
 	return m.isMaterializedViewFn(schema, table)
+}
+
+func (m *mockSchemaObserver) isEnumType(string) bool {
+	return false
 }
 
 func (m *mockSchemaObserver) update(ddlEvent *wal.DDLEvent) {

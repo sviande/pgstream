@@ -555,7 +555,7 @@ func TestBatchWriter_flushQueries(t *testing.T) {
 
 func mustNewDMLAdapter(t *testing.T) *dmlAdapter {
 	t.Helper()
-	a, err := newDMLAdapter("", false, loglib.NewNoopLogger())
+	a, err := newDMLAdapter("", false, loglib.NewNoopLogger(), false, nil)
 	require.NoError(t, err)
 	return a
 }

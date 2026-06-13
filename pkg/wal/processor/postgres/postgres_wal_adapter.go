@@ -13,6 +13,7 @@ import (
 type walAdapter interface {
 	walEventToQueries(ctx context.Context, e *wal.Event) ([]*query, error)
 	walEventToMessage(ctx context.Context, e *wal.Event) (*walMessage, error)
+	isEnumType(colType string) bool
 	close() error
 }
 
@@ -21,6 +22,7 @@ type schemaObserver interface {
 	getAlwaysIdentityColumnNames(ctx context.Context, schema, table string) (map[string]struct{}, error)
 	getSequenceColumns(ctx context.Context, schema, table string) (map[string]string, error)
 	isMaterializedView(ctx context.Context, schema, table string) bool
+	isEnumType(colType string) bool
 	update(ddlEvent *wal.DDLEvent)
 	close() error
 }
@@ -57,7 +59,7 @@ func newAdapter(ctx context.Context, logger loglib.Logger, ignoreDDL bool, pgURL
 		return nil, err
 	}
 
-	dmlAdapter, err := newDMLAdapter(onConflictAction, forCopy, logger)
+	dmlAdapter, err := newDMLAdapter(onConflictAction, forCopy, logger, convertEnumsToText, schemaObserver.isEnumType)
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +171,10 @@ func (a *adapter) walEventToMessage(ctx context.Context, e *wal.Event) (*walMess
 			},
 		}, nil
 	}
+}
+
+func (a *adapter) isEnumType(colType string) bool {
+	return a.schemaObserver.isEnumType(colType)
 }
 
 func (a *adapter) close() error {

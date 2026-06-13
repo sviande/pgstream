@@ -140,6 +140,11 @@ func (a *dmlAdapter) buildBulkDeleteSinglePK(events []*wal.Data, refCol wal.Colu
 
 	colName := pglib.QuoteIdentifier(refCol.Name)
 	arrayType := pgArrayType(refCol.Type)
+	// when converting enums to text, an enum-typed PK column is TEXT on the
+	// target, so the source enum array type does not exist there: cast to text[].
+	if a.convertEnumsToText && a.isEnumType != nil && a.isEnumType(refCol.Type) {
+		arrayType = "text[]"
+	}
 	sql := fmt.Sprintf("DELETE FROM %s WHERE %s = ANY($1::%s)", tableName, colName, arrayType)
 
 	return &query{

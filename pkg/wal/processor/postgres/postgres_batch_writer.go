@@ -35,7 +35,7 @@ func NewBatchWriter(ctx context.Context, config *Config, opts ...WriterOption) (
 		return nil, err
 	}
 
-	dml, err := newDMLAdapter(config.OnConflictAction, false, w.logger)
+	dml, err := newDMLAdapter(config.OnConflictAction, false, w.logger, config.ConvertEnumsToText, w.adapter.isEnumType)
 	if err != nil {
 		return nil, err
 	}
