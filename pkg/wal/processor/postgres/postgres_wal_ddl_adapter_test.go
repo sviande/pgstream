@@ -216,7 +216,7 @@ func TestDDLAdapter_walDataToQueries(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			adapter := newDDLAdapter()
+			adapter := newDDLAdapter(nil)
 			queries, err := adapter.walDataToQueries(context.Background(), tc.walData)
 			require.ErrorIs(t, err, tc.wantErr)
 			require.ElementsMatch(t, queries, tc.wantQueries)

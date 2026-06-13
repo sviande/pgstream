@@ -7,6 +7,7 @@ import (
 
 	"github.com/xataio/pgstream/pkg/backoff"
 	"github.com/xataio/pgstream/pkg/wal/processor/batch"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 type Config struct {
@@ -17,6 +18,17 @@ type Config struct {
 	BulkIngestEnabled bool
 	RetryPolicy       backoff.Config
 	IgnoreDDL         bool
+	// SourceURL is the source database URL. It is only used to bootstrap the
+	// set of existing ENUM types when ConvertEnumsToText is enabled, so that DDL
+	// referencing a pre-existing enum is converted even though its CREATE TYPE
+	// predates the replication stream.
+	SourceURL string
+	// ConvertEnumsToText rewrites replicated DDL so ENUM types are never created
+	// on the target and ENUM columns become TEXT/TEXT[], matching the snapshot.
+	ConvertEnumsToText bool
+	// TableRenamer, when set, rewrites table identifiers in replicated DDL (e.g.
+	// public.foo -> public.piana_foo), matching the snapshot schema renamer.
+	TableRenamer *renamer.TableRenamer
 }
 
 const (

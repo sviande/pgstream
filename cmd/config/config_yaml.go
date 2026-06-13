@@ -717,12 +717,13 @@ func (c *YAMLConfig) parsePostgresProcessorConfig() (*stream.PostgresProcessorCo
 
 	cfg := &stream.PostgresProcessorConfig{
 		BatchWriter: postgres.Config{
-			URL:              c.Target.Postgres.URL,
-			BatchConfig:      c.Target.Postgres.Batch.parseBatchConfig(),
-			DisableTriggers:  c.Target.Postgres.DisableTriggers,
-			OnConflictAction: c.Target.Postgres.OnConflictAction,
-			RetryPolicy:      c.Target.Postgres.RetryPolicy.parseBackoffConfig(),
-			IgnoreDDL:        c.Target.Postgres.IgnoreDDL,
+			URL:                c.Target.Postgres.URL,
+			BatchConfig:        c.Target.Postgres.Batch.parseBatchConfig(),
+			DisableTriggers:    c.Target.Postgres.DisableTriggers,
+			OnConflictAction:   c.Target.Postgres.OnConflictAction,
+			RetryPolicy:        c.Target.Postgres.RetryPolicy.parseBackoffConfig(),
+			IgnoreDDL:          c.Target.Postgres.IgnoreDDL,
+			ConvertEnumsToText: c.Target.Postgres.ConvertEnumsToText,
 		},
 	}
 
@@ -731,6 +732,23 @@ func (c *YAMLConfig) parsePostgresProcessorConfig() (*stream.PostgresProcessorCo
 		if cfg.BatchWriter.BulkIngestEnabled {
 			applyPostgresBulkBatchDefaults(&cfg.BatchWriter.BatchConfig)
 		}
+	}
+
+	// the source URL is needed to bootstrap the existing enum types when
+	// convert_enums_to_text is enabled, so DDL referencing a pre-existing enum
+	// is converted even though its CREATE TYPE predates the replication stream.
+	if c.Target.Postgres.ConvertEnumsToText && c.Source.Postgres != nil {
+		cfg.BatchWriter.SourceURL = c.Source.Postgres.URL
+	}
+
+	// table renamer for DDL table renaming, matching the snapshot schema renamer
+	renamerCfg := c.parseTableRenamerConfig()
+	if renamerCfg != nil {
+		tableRenamer, err := renamer.NewTableRenamer(renamerCfg)
+		if err != nil {
+			return nil, fmt.Errorf("creating table renamer for postgres processor: %w", err)
+		}
+		cfg.BatchWriter.TableRenamer = tableRenamer
 	}
 
 	return cfg, nil

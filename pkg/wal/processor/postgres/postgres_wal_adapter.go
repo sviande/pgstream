@@ -7,6 +7,7 @@ import (
 
 	loglib "github.com/xataio/pgstream/pkg/log"
 	"github.com/xataio/pgstream/pkg/wal"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 type walAdapter interface {
@@ -50,8 +51,8 @@ type (
 	ddlEventAdapter func(*wal.Data) (*wal.DDLEvent, error)
 )
 
-func newAdapter(ctx context.Context, logger loglib.Logger, ignoreDDL bool, pgURL string, onConflictAction string, forCopy bool) (*adapter, error) {
-	schemaObserver, err := newPGSchemaObserver(ctx, pgURL, logger)
+func newAdapter(ctx context.Context, logger loglib.Logger, ignoreDDL bool, pgURL string, onConflictAction string, forCopy bool, sourceURL string, convertEnumsToText bool, tableRenamer *renamer.TableRenamer) (*adapter, error) {
+	schemaObserver, err := newPGSchemaObserver(ctx, pgURL, sourceURL, convertEnumsToText, tableRenamer, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +64,7 @@ func newAdapter(ctx context.Context, logger loglib.Logger, ignoreDDL bool, pgURL
 
 	var ddl ddlQueryAdapter
 	if !ignoreDDL {
-		ddl = newDDLAdapter()
+		ddl = newDDLAdapter(schemaObserver)
 	}
 
 	return &adapter{

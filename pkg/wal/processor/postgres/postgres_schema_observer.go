@@ -5,11 +5,14 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	pglib "github.com/xataio/pgstream/internal/postgres"
+	"github.com/xataio/pgstream/internal/postgres/ddlrewrite"
 	synclib "github.com/xataio/pgstream/internal/sync"
 	loglib "github.com/xataio/pgstream/pkg/log"
 	"github.com/xataio/pgstream/pkg/wal"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 // pgSchemaObserver keeps track of schema metadata including generated column
@@ -29,25 +32,101 @@ type pgSchemaObserver struct {
 	materializedViews *synclib.Map[string, map[string]struct{}]
 	// columnTableSequences is a map of schema.table to a map of sequence column names.
 	columnTableSequences *synclib.Map[string, map[string]string]
+
+	// convertEnumsToText enables ENUM->TEXT rewriting of replicated DDL.
+	convertEnumsToText bool
+	// tableRenamer, when set, rewrites table identifiers in replicated DDL.
+	tableRenamer *renamer.TableRenamer
+	// enumMu guards enumTracker, which is not safe for concurrent use.
+	enumMu sync.Mutex
+	// enumTracker tracks the source ENUM types (bootstrapped at startup and kept
+	// in sync with CREATE/ALTER/DROP TYPE events) so DDL referencing an enum is
+	// converted to TEXT consistently with the snapshot generator.
+	enumTracker *ddlrewrite.EnumTypeTracker
 }
 
 // newPGSchemaObserver returns a postgres observer that tracks schemas,
 // including generated table columns and materialized views. It keeps a cache to
 // reduce the number of calls to postgres, and it updates the state whenever a
 // DDL event is received through the WAL.
-func newPGSchemaObserver(ctx context.Context, pgURL string, logger loglib.Logger) (*pgSchemaObserver, error) {
+func newPGSchemaObserver(ctx context.Context, pgURL, sourceURL string, convertEnumsToText bool, tableRenamer *renamer.TableRenamer, logger loglib.Logger) (*pgSchemaObserver, error) {
 	pgConn, err := pglib.NewConnPool(ctx, pgURL)
 	if err != nil {
 		return nil, err
 	}
-	return &pgSchemaObserver{
+	o := &pgSchemaObserver{
 		pgConn:                     pgConn,
 		generatedTableColumns:      synclib.NewMap[string, map[string]struct{}](),
 		alwaysIdentityTableColumns: synclib.NewMap[string, map[string]struct{}](),
 		materializedViews:          synclib.NewMap[string, map[string]struct{}](),
 		columnTableSequences:       synclib.NewMap[string, map[string]string](),
 		logger:                     logger,
-	}, nil
+		convertEnumsToText:         convertEnumsToText,
+		tableRenamer:               tableRenamer,
+		enumTracker:                ddlrewrite.NewEnumTypeTracker(),
+	}
+
+	// when converting enums, preload the set of existing source enum types so DDL
+	// referencing an enum created before the stream started is still converted.
+	if convertEnumsToText && sourceURL != "" {
+		if err := o.bootstrapEnumTypes(ctx, sourceURL); err != nil {
+			_ = pgConn.Close(context.Background())
+			return nil, err
+		}
+	}
+
+	return o, nil
+}
+
+const enumTypesQuery = `SELECT n.nspname, t.typname
+	FROM pg_type t
+	JOIN pg_namespace n ON n.oid = t.typnamespace
+	WHERE t.typtype = 'e'`
+
+// bootstrapEnumTypes preloads the enum tracker with the enum types that already
+// exist on the source, opening a one-time connection to the source database.
+func (o *pgSchemaObserver) bootstrapEnumTypes(ctx context.Context, sourceURL string) error {
+	conn, err := pglib.NewConnPool(ctx, sourceURL)
+	if err != nil {
+		return fmt.Errorf("connecting to source for enum bootstrap: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	rows, err := conn.Query(ctx, enumTypesQuery)
+	if err != nil {
+		return fmt.Errorf("querying source enum types: %w", err)
+	}
+	defer rows.Close()
+
+	o.enumMu.Lock()
+	defer o.enumMu.Unlock()
+	count := 0
+	for rows.Next() {
+		var schema, name string
+		if err := rows.Scan(&schema, &name); err != nil {
+			return fmt.Errorf("scanning enum type: %w", err)
+		}
+		o.enumTracker.Add(schema + "." + name)
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	o.logger.Info("bootstrapped enum types from source for DDL conversion", loglib.Fields{"enum_count": count})
+	return nil
+}
+
+// RewriteDDL rewrites a raw replicated DDL statement for the target (ENUM->TEXT
+// + table renaming), returning skip=true when it must not be applied. It is
+// safe for concurrent use.
+func (o *pgSchemaObserver) RewriteDDL(ddl, commandTag string) (string, bool) {
+	o.enumMu.Lock()
+	defer o.enumMu.Unlock()
+	var tr ddlrewrite.TableRenamer
+	if o.tableRenamer != nil {
+		tr = o.tableRenamer
+	}
+	return ddlrewrite.RewriteDDL(ddl, commandTag, o.convertEnumsToText, o.enumTracker, tr)
 }
 
 // getGeneratedColumnNames will return a list of generated column names for the
@@ -134,6 +213,12 @@ func (o *pgSchemaObserver) getSequenceColumns(ctx context.Context, schema, table
 func (o *pgSchemaObserver) update(ddlEvent *wal.DDLEvent) {
 	if ddlEvent == nil {
 		return
+	}
+
+	if o.convertEnumsToText {
+		o.enumMu.Lock()
+		ddlrewrite.UpdateTrackerFromEnumDDL(o.enumTracker, ddlEvent.CommandTag, ddlEvent.DDL)
+		o.enumMu.Unlock()
 	}
 
 	tableObjects := append(ddlEvent.GetTableObjects(), ddlEvent.GetTableColumnObjects()...)
