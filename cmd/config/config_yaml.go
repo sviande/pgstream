@@ -5,6 +5,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/xataio/pgstream/internal/health"
@@ -23,6 +24,7 @@ import (
 	"github.com/xataio/pgstream/pkg/wal/processor/injector"
 	kafkaprocessor "github.com/xataio/pgstream/pkg/wal/processor/kafka"
 	"github.com/xataio/pgstream/pkg/wal/processor/postgres"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 	"github.com/xataio/pgstream/pkg/wal/processor/search"
 	"github.com/xataio/pgstream/pkg/wal/processor/search/store"
 	"github.com/xataio/pgstream/pkg/wal/processor/transformer"
@@ -96,6 +98,7 @@ type SnapshotConfig struct {
 	Mode                    string                  `mapstructure:"mode" yaml:"mode"`
 	Tables                  []string                `mapstructure:"tables" yaml:"tables"`
 	ExcludedTables          []string                `mapstructure:"excluded_tables" yaml:"excluded_tables"`
+	ExcludedViews           []string                `mapstructure:"excluded_views" yaml:"excluded_views"`
 	Recorder                *SnapshotRecorderConfig `mapstructure:"recorder" yaml:"recorder"`
 	SnapshotWorkers         int                     `mapstructure:"snapshot_workers" yaml:"snapshot_workers"`
 	Data                    *SnapshotDataConfig     `mapstructure:"data" yaml:"data"`
@@ -129,6 +132,7 @@ type PgDumpPgRestoreConfig struct {
 	NoPrivileges           bool     `mapstructure:"no_privileges" yaml:"no_privileges"`
 	DumpFile               string   `mapstructure:"dump_file" yaml:"dump_file"`
 	ExcludedSecurityLabels []string `mapstructure:"excluded_security_labels" yaml:"excluded_security_labels"`
+	ExcludeDropSchema      bool     `mapstructure:"exclude_drop_schema" yaml:"exclude_drop_schema"`
 }
 
 type ReplicationConfig struct {
@@ -186,13 +190,17 @@ type ConstantBackoffConfig struct {
 }
 
 type PostgresTargetConfig struct {
-	URL              string            `mapstructure:"url" yaml:"url"`
-	Batch            *BatchConfig      `mapstructure:"batch" yaml:"batch"`
-	BulkIngest       *BulkIngestConfig `mapstructure:"bulk_ingest" yaml:"bulk_ingest"`
-	DisableTriggers  bool              `mapstructure:"disable_triggers" yaml:"disable_triggers"`
-	OnConflictAction string            `mapstructure:"on_conflict_action" yaml:"on_conflict_action"`
-	RetryPolicy      BackoffConfig     `mapstructure:"retry_policy" yaml:"retry_policy"`
-	IgnoreDDL        bool              `mapstructure:"ignore_ddl" yaml:"ignore_ddl"`
+	URL                     string            `mapstructure:"url" yaml:"url"`
+	Batch                   *BatchConfig      `mapstructure:"batch" yaml:"batch"`
+	BulkIngest              *BulkIngestConfig `mapstructure:"bulk_ingest" yaml:"bulk_ingest"`
+	DisableTriggers         bool              `mapstructure:"disable_triggers" yaml:"disable_triggers"`
+	OnConflictAction        string            `mapstructure:"on_conflict_action" yaml:"on_conflict_action"`
+	RetryPolicy             BackoffConfig     `mapstructure:"retry_policy" yaml:"retry_policy"`
+	IgnoreDDL               bool              `mapstructure:"ignore_ddl" yaml:"ignore_ddl"`
+	ExcludeCheckConstraints bool              `mapstructure:"exclude_check_constraints" yaml:"exclude_check_constraints"`
+	ExcludeTriggers         bool              `mapstructure:"exclude_triggers" yaml:"exclude_triggers"`
+	ExcludeForeignKeys      bool              `mapstructure:"exclude_foreign_keys" yaml:"exclude_foreign_keys"`
+	ConvertEnumsToText      bool              `mapstructure:"convert_enums_to_text" yaml:"convert_enums_to_text"`
 }
 
 type KafkaTargetConfig struct {
@@ -287,6 +295,21 @@ type ModifiersConfig struct {
 	Transformations *TransformationsConfig `mapstructure:"transformations" yaml:"transformations"`
 	Filter          *FilterConfig          `mapstructure:"filter" yaml:"filter"`
 	Sanitize        *SanitizeConfig        `mapstructure:"sanitize" yaml:"sanitize"`
+	TableRenamer    *TableRenamerConfig    `mapstructure:"table_renamer" yaml:"table_renamer"`
+}
+
+type TableRenamerConfig struct {
+	Rules []TableRenameRuleConfig `mapstructure:"rules" yaml:"rules"`
+}
+
+type TableRenameRuleConfig struct {
+	// Schema filter - only apply to tables in this schema.
+	// Use "*" or empty string to match all schemas.
+	Schema string `mapstructure:"schema" yaml:"schema"`
+	// Match is the regex pattern to match against the table name.
+	Match string `mapstructure:"match" yaml:"match"`
+	// Replace is the replacement string (supports capture groups $1, $2, etc.).
+	Replace string `mapstructure:"replace" yaml:"replace"`
 }
 
 type InjectorConfig struct {
@@ -428,16 +451,21 @@ func (c *YAMLConfig) parseListenerConfig() (stream.ListenerConfig, error) {
 }
 
 func (c *YAMLConfig) parseProcessorConfig() (stream.ProcessorConfig, error) {
-	streamCfg := stream.ProcessorConfig{
-		Kafka:    c.parseKafkaProcessorConfig(),
-		Postgres: c.parsePostgresProcessorConfig(),
-		Webhook:  c.parseWebhookProcessorConfig(),
-		Stdout:   c.parseStdoutProcessorConfig(),
-		Filter:   c.parseFilterConfig(),
-		Sanitize: c.parseSanitizeConfig(),
+	postgresCfg, err := c.parsePostgresProcessorConfig()
+	if err != nil {
+		return stream.ProcessorConfig{}, err
 	}
 
-	var err error
+	streamCfg := stream.ProcessorConfig{
+		Kafka:        c.parseKafkaProcessorConfig(),
+		Postgres:     postgresCfg,
+		Webhook:      c.parseWebhookProcessorConfig(),
+		Stdout:       c.parseStdoutProcessorConfig(),
+		Filter:       c.parseFilterConfig(),
+		Sanitize:     c.parseSanitizeConfig(),
+		TableRenamer: c.parseTableRenamerConfig(),
+	}
+
 	streamCfg.Injector, err = c.parseInjectorConfig()
 	if err != nil {
 		return stream.ProcessorConfig{}, err
@@ -518,6 +546,7 @@ func (c *YAMLConfig) parseSnapshotConfig() (*snapshotbuilder.SnapshotListenerCon
 		Adapter: adapter.SnapshotConfig{
 			Tables:         snapshotConfig.Tables,
 			ExcludedTables: snapshotConfig.ExcludedTables,
+			ExcludedViews:  snapshotConfig.ExcludedViews,
 		},
 		DisableProgressTracking: snapshotConfig.DisableProgressTracking,
 	}
@@ -557,6 +586,16 @@ func (c *YAMLConfig) parseSnapshotConfig() (*snapshotbuilder.SnapshotListenerCon
 		}
 	}
 
+	// Create table renamer for snapshot schema if configured
+	renamerCfg := c.parseTableRenamerConfig()
+	if renamerCfg != nil {
+		var err error
+		streamCfg.TableRenamer, err = renamer.NewTableRenamer(renamerCfg)
+		if err != nil {
+			return nil, fmt.Errorf("creating table renamer for snapshot: %w", err)
+		}
+	}
+
 	return streamCfg, nil
 }
 
@@ -589,8 +628,9 @@ func (c *YAMLConfig) parseSchemaSnapshotConfig() (*snapshotbuilder.SchemaSnapsho
 	}
 	streamSchemaCfg := &snapshotbuilder.SchemaSnapshotConfig{
 		DumpRestore: &pgdumprestore.Config{
-			SourcePGURL: c.Source.Postgres.URL,
-			TargetPGURL: targetURL,
+			SourcePGURL:   c.Source.Postgres.URL,
+			TargetPGURL:   targetURL,
+			ExcludedViews: schemaTableMapHelper(c.Source.Postgres.Snapshot.ExcludedViews),
 		},
 	}
 
@@ -603,12 +643,21 @@ func (c *YAMLConfig) parseSchemaSnapshotConfig() (*snapshotbuilder.SchemaSnapsho
 		streamSchemaCfg.DumpRestore.NoPrivileges = schemaSnapshotCfg.PgDumpPgRestore.NoPrivileges
 		streamSchemaCfg.DumpRestore.DumpDebugFile = schemaSnapshotCfg.PgDumpPgRestore.DumpFile
 		streamSchemaCfg.DumpRestore.ExcludedSecurityLabels = schemaSnapshotCfg.PgDumpPgRestore.ExcludedSecurityLabels
+		streamSchemaCfg.DumpRestore.ExcludeDropSchema = schemaSnapshotCfg.PgDumpPgRestore.ExcludeDropSchema
 
 		var err error
 		streamSchemaCfg.DumpRestore.RolesSnapshotMode, err = getRolesSnapshotMode(schemaSnapshotCfg.PgDumpPgRestore.RolesSnapshotMode)
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// propagate exclude options from target.postgres config
+	if c.Target.Postgres != nil {
+		streamSchemaCfg.DumpRestore.ExcludeCheckConstraints = c.Target.Postgres.ExcludeCheckConstraints
+		streamSchemaCfg.DumpRestore.ExcludeTriggers = c.Target.Postgres.ExcludeTriggers
+		streamSchemaCfg.DumpRestore.ExcludeForeignKeys = c.Target.Postgres.ExcludeForeignKeys
+		streamSchemaCfg.DumpRestore.ConvertEnumsToText = c.Target.Postgres.ConvertEnumsToText
 	}
 
 	return streamSchemaCfg, nil
@@ -661,9 +710,9 @@ func (c *YAMLConfig) parseStdoutProcessorConfig() *stream.StdoutProcessorConfig 
 	return &stream.StdoutProcessorConfig{}
 }
 
-func (c *YAMLConfig) parsePostgresProcessorConfig() *stream.PostgresProcessorConfig {
+func (c *YAMLConfig) parsePostgresProcessorConfig() (*stream.PostgresProcessorConfig, error) {
 	if c.Target.Postgres == nil {
-		return nil
+		return nil, nil
 	}
 
 	cfg := &stream.PostgresProcessorConfig{
@@ -684,7 +733,7 @@ func (c *YAMLConfig) parsePostgresProcessorConfig() *stream.PostgresProcessorCon
 		}
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 func (c *YAMLConfig) parseSearchProcessorConfig() (*stream.SearchProcessorConfig, error) {
@@ -778,6 +827,21 @@ func (c YAMLConfig) parseSanitizeConfig() *stream.SanitizeConfig {
 	return &stream.SanitizeConfig{
 		StripNullCharBytes: c.Modifiers.Sanitize.StripNullCharBytes,
 	}
+}
+
+func (c YAMLConfig) parseTableRenamerConfig() *renamer.Config {
+	if c.Modifiers.TableRenamer == nil || len(c.Modifiers.TableRenamer.Rules) == 0 {
+		return nil
+	}
+	rules := make([]renamer.Rule, 0, len(c.Modifiers.TableRenamer.Rules))
+	for _, r := range c.Modifiers.TableRenamer.Rules {
+		rules = append(rules, renamer.Rule{
+			Schema:  r.Schema,
+			Match:   r.Match,
+			Replace: r.Replace,
+		})
+	}
+	return &renamer.Config{Rules: rules}
 }
 
 func (c TransformationsConfig) parseTransformationConfig() (*transformer.Config, error) {
@@ -947,4 +1011,26 @@ func (bc *BatchConfig) parseBatchConfig() batch.Config {
 	}
 
 	return cfg
+}
+
+// schemaTableMapHelper converts a list of qualified table names (schema.table)
+// into a map of schema -> []table. This duplicates the logic from
+// pkg/wal/listener/snapshot/adapter/config.go:schemaTableMap
+func schemaTableMapHelper(tables []string) map[string][]string {
+	if len(tables) == 0 {
+		return nil
+	}
+	const publicSchema = "public"
+	schemaTableMap := make(map[string][]string, len(tables))
+	for _, table := range tables {
+		schemaName := publicSchema
+		tableName := table
+		tableSplit := strings.Split(table, ".")
+		if len(tableSplit) == 2 {
+			schemaName = tableSplit[0]
+			tableName = tableSplit[1]
+		}
+		schemaTableMap[schemaName] = append(schemaTableMap[schemaName], tableName)
+	}
+	return schemaTableMap
 }

@@ -9,6 +9,7 @@ import (
 type SnapshotConfig struct {
 	Tables         []string
 	ExcludedTables []string
+	ExcludedViews  []string
 }
 
 const publicSchema = "public"

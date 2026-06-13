@@ -19,6 +19,7 @@ import (
 	"github.com/xataio/pgstream/pkg/wal/listener"
 	listenersnapshot "github.com/xataio/pgstream/pkg/wal/listener/snapshot"
 	"github.com/xataio/pgstream/pkg/wal/listener/snapshot/adapter"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 // NewSnapshotGenerator builds a snapshot generator based on the
@@ -74,7 +75,7 @@ func NewSnapshotGenerator(ctx context.Context, cfg *SnapshotListenerConfig, p li
 
 	if cfg.Schema != nil {
 		// postgres schema snapshot generator layer
-		g, err = newSchemaSnapshotGenerator(ctx, cfg.Schema, g, p, logger, instrumentation, !cfg.DisableProgressTracking, restoreConflictTargetsBeforeData)
+		g, err = newSchemaSnapshotGenerator(ctx, cfg.Schema, g, p, logger, instrumentation, !cfg.DisableProgressTracking, restoreConflictTargetsBeforeData, cfg.TableRenamer)
 		if err != nil {
 			return nil, err
 		}
@@ -106,7 +107,7 @@ func NewSnapshotGenerator(ctx context.Context, cfg *SnapshotListenerConfig, p li
 	return adapter.NewSnapshotGeneratorAdapter(&cfg.Adapter, g, adapter.WithLogger(logger)), nil
 }
 
-func newSchemaSnapshotGenerator(ctx context.Context, cfg *SchemaSnapshotConfig, g generator.SnapshotGenerator, processor listener.Processor, logger loglib.Logger, instrumentation *otel.Instrumentation, progressTracking, restoreConflictTargetsBeforeData bool) (generator.SnapshotGenerator, error) {
+func newSchemaSnapshotGenerator(ctx context.Context, cfg *SchemaSnapshotConfig, g generator.SnapshotGenerator, processor listener.Processor, logger loglib.Logger, instrumentation *otel.Instrumentation, progressTracking, restoreConflictTargetsBeforeData bool, tableRenamer *renamer.TableRenamer) (generator.SnapshotGenerator, error) {
 	// postgres pgdump schema snapshot generator
 	opts := []pgdumprestoregenerator.Option{
 		pgdumprestoregenerator.WithLogger(logger),
@@ -122,6 +123,9 @@ func newSchemaSnapshotGenerator(ctx context.Context, cfg *SchemaSnapshotConfig, 
 		// if no target postgres is provided, use WAL restore instead of
 		// direct pgrestore
 		opts = append(opts, pgdumprestoregenerator.WithRestoreToWAL(processor))
+	}
+	if tableRenamer != nil && tableRenamer.HasRules() {
+		opts = append(opts, pgdumprestoregenerator.WithTableRenamer(tableRenamer))
 	}
 	if restoreConflictTargetsBeforeData {
 		opts = append(opts, pgdumprestoregenerator.WithRestoreConflictTargetsBeforeData())

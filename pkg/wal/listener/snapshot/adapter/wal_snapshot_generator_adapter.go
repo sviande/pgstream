@@ -17,6 +17,7 @@ type SnapshotGeneratorAdapter struct {
 	generator            generator.SnapshotGenerator
 	schemaTables         map[string][]string
 	schemaExcludedTables map[string][]string
+	schemaExcludedViews  map[string][]string
 }
 
 type Option func(a *SnapshotGeneratorAdapter)
@@ -26,6 +27,7 @@ func NewSnapshotGeneratorAdapter(cfg *SnapshotConfig, generator generator.Snapsh
 		generator:            generator,
 		schemaTables:         schemaTableMap(cfg.Tables),
 		schemaExcludedTables: schemaTableMap(cfg.ExcludedTables),
+		schemaExcludedViews:  schemaTableMap(cfg.ExcludedViews),
 		logger:               loglib.NewNoopLogger(),
 	}
 
@@ -53,6 +55,7 @@ func (s *SnapshotGeneratorAdapter) CreateSnapshot(ctx context.Context) (err erro
 	snapshot := &snapshot.Snapshot{
 		SchemaTables:         s.schemaTables,
 		SchemaExcludedTables: s.schemaExcludedTables,
+		SchemaExcludedViews:  s.schemaExcludedViews,
 	}
 	if err := s.generator.CreateSnapshot(ctx, snapshot); err != nil {
 		s.logger.Error(err, "creating snapshot", loglib.Fields{"schemas": snapshot.GetSchemas(), "tables": snapshot.GetTables()})

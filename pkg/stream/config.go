@@ -16,6 +16,7 @@ import (
 	"github.com/xataio/pgstream/pkg/wal/processor/injector"
 	kafkaprocessor "github.com/xataio/pgstream/pkg/wal/processor/kafka"
 	"github.com/xataio/pgstream/pkg/wal/processor/postgres"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 	"github.com/xataio/pgstream/pkg/wal/processor/search"
 	"github.com/xataio/pgstream/pkg/wal/processor/search/store"
 	"github.com/xataio/pgstream/pkg/wal/processor/transformer"
@@ -51,15 +52,16 @@ type SanitizeConfig struct {
 }
 
 type ProcessorConfig struct {
-	Kafka       *KafkaProcessorConfig
-	Search      *SearchProcessorConfig
-	Webhook     *WebhookProcessorConfig
-	Postgres    *PostgresProcessorConfig
-	Stdout      *StdoutProcessorConfig
-	Injector    *injector.Config
-	Transformer *transformer.Config
-	Filter      *filter.Config
-	Sanitize    *SanitizeConfig
+	Kafka        *KafkaProcessorConfig
+	Search       *SearchProcessorConfig
+	Webhook      *WebhookProcessorConfig
+	Postgres     *PostgresProcessorConfig
+	Stdout       *StdoutProcessorConfig
+	Injector     *injector.Config
+	Transformer  *transformer.Config
+	Filter       *filter.Config
+	Sanitize     *SanitizeConfig
+	TableRenamer *renamer.Config
 }
 
 type StdoutProcessorConfig struct{}

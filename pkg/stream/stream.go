@@ -17,6 +17,7 @@ import (
 	processinstrumentation "github.com/xataio/pgstream/pkg/wal/processor/instrumentation"
 	kafkaprocessor "github.com/xataio/pgstream/pkg/wal/processor/kafka"
 	pgwriter "github.com/xataio/pgstream/pkg/wal/processor/postgres"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 	"github.com/xataio/pgstream/pkg/wal/processor/sanitizer"
 	"github.com/xataio/pgstream/pkg/wal/processor/search"
 	searchinstrumentation "github.com/xataio/pgstream/pkg/wal/processor/search/instrumentation"
@@ -234,6 +235,16 @@ func addProcessorModifiers(ctx context.Context, config *Config, logger loglib.Lo
 		if err != nil {
 			logger.Error(err, "creating transformer layer")
 			return nil, nil, err
+		}
+	}
+
+	if config.Processor.TableRenamer != nil {
+		logger.Info("adding table renaming to processor...")
+		var err error
+		processor, err = renamer.New(processor, config.Processor.TableRenamer,
+			renamer.WithLogger(logger))
+		if err != nil {
+			return nil, nil, fmt.Errorf("error creating table renamer layer: %w", err)
 		}
 	}
 
