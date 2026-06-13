@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -21,24 +22,33 @@ import (
 	"github.com/xataio/pgstream/pkg/snapshot"
 	"github.com/xataio/pgstream/pkg/snapshot/generator"
 	"github.com/xataio/pgstream/pkg/wal/processor"
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 // SnapshotGenerator generates postgres schema snapshots using pg_dump and
 // pg_restore
 type SnapshotGenerator struct {
-	sourceURL              string
-	targetURL              string
-	pgDumpFn               pglib.PGDumpFn
-	pgDumpAllFn            pglib.PGDumpAllFn
-	pgRestoreFn            pglib.PGRestoreFn
-	sourceQuerier          pglib.Querier
-	logger                 loglib.Logger
-	generator              generator.SnapshotGenerator
-	dumpDebugFile          string
-	excludedSecurityLabels []string
-	roleSQLParser          *roleSQLParser
-	optionGenerator        *optionGenerator
-	snapshotTracker        snapshotProgressTracker
+	sourceURL               string
+	targetURL               string
+	pgDumpFn                pglib.PGDumpFn
+	pgDumpAllFn             pglib.PGDumpAllFn
+	pgRestoreFn             pglib.PGRestoreFn
+	sourceQuerier           pglib.Querier
+	logger                  loglib.Logger
+	generator               generator.SnapshotGenerator
+	dumpDebugFile           string
+	excludedSecurityLabels  []string
+	excludedViews           map[string][]string
+	excludeCheckConstraints bool
+	excludeTriggers         bool
+	excludeForeignKeys      bool
+	convertEnumsToText      bool
+	excludeDropSchema       bool
+	roleSQLParser           *roleSQLParser
+	optionGenerator         *optionGenerator
+	snapshotTracker         snapshotProgressTracker
+	// table renamer for transforming table names in the SQL dump
+	tableRenamer *renamer.TableRenamer
 	// restoreConflictTargetsBeforeData restores constraints/indexes that can
 	// be used as INSERT ... ON CONFLICT targets before the wrapped data snapshot
 	// generator runs. Other indexes and constraints, such as foreign keys, are
@@ -72,6 +82,20 @@ type Config struct {
 	DumpDebugFile string
 	// if set, security label providers that will be excluded from the dump
 	ExcludedSecurityLabels []string
+	// Views to exclude from the snapshot (filtered during dump parsing for wildcards)
+	ExcludedViews map[string][]string
+	// ExcludeCheckConstraints excludes CHECK constraints from schema snapshot
+	ExcludeCheckConstraints bool
+	// ExcludeTriggers excludes triggers from schema snapshot
+	ExcludeTriggers bool
+	// ExcludeForeignKeys excludes foreign key constraints from schema snapshot
+	ExcludeForeignKeys bool
+	// ConvertEnumsToText converts all ENUM types to TEXT in the target database.
+	// When enabled, ENUM types will not be created and ENUM columns will be created as TEXT/TEXT[]
+	ConvertEnumsToText bool
+	// ExcludeDropSchema excludes DROP SCHEMA and CREATE SCHEMA statements from cleanup
+	// when clean_target_db is enabled. Useful when schemas should already exist in target.
+	ExcludeDropSchema bool
 }
 
 type Option func(s *SnapshotGenerator)
@@ -83,6 +107,7 @@ type dump struct {
 	indicesAndConstraints []byte
 	views                 []byte
 	sequences             []string
+	enumTracker           *enumTypeTracker // Tracks ENUM types for conversion after table renaming
 	roles                 map[string]role
 	eventTriggers         []byte
 }
@@ -101,17 +126,23 @@ func NewSnapshotGenerator(ctx context.Context, c *Config, opts ...Option) (*Snap
 	}
 
 	sg := &SnapshotGenerator{
-		sourceURL:              c.SourcePGURL,
-		targetURL:              c.TargetPGURL,
-		pgDumpFn:               pglib.RunPGDump,
-		pgDumpAllFn:            pglib.RunPGDumpAll,
-		pgRestoreFn:            pglib.RunPGRestore,
-		logger:                 loglib.NewNoopLogger(),
-		dumpDebugFile:          c.DumpDebugFile,
-		excludedSecurityLabels: c.ExcludedSecurityLabels,
-		roleSQLParser:          &roleSQLParser{},
-		sourceQuerier:          sourceConnPool,
-		optionGenerator:        newOptionGenerator(sourceConnPool, c),
+		sourceURL:               c.SourcePGURL,
+		targetURL:               c.TargetPGURL,
+		pgDumpFn:                pglib.RunPGDump,
+		pgDumpAllFn:             pglib.RunPGDumpAll,
+		pgRestoreFn:             pglib.RunPGRestore,
+		logger:                  loglib.NewNoopLogger(),
+		dumpDebugFile:           c.DumpDebugFile,
+		excludedSecurityLabels:  c.ExcludedSecurityLabels,
+		excludedViews:           c.ExcludedViews,
+		excludeCheckConstraints: c.ExcludeCheckConstraints,
+		excludeTriggers:         c.ExcludeTriggers,
+		excludeForeignKeys:      c.ExcludeForeignKeys,
+		convertEnumsToText:      c.ConvertEnumsToText,
+		excludeDropSchema:       c.ExcludeDropSchema,
+		roleSQLParser:           &roleSQLParser{},
+		sourceQuerier:           sourceConnPool,
+		optionGenerator:         newOptionGenerator(sourceConnPool, c),
 	}
 
 	for _, opt := range opts {
@@ -179,6 +210,13 @@ func WithRestoreConflictTargetsBeforeData() Option {
 	}
 }
 
+// WithTableRenamer sets the table renamer for transforming table names in the SQL dump.
+func WithTableRenamer(tr *renamer.TableRenamer) Option {
+	return func(sg *SnapshotGenerator) {
+		sg.tableRenamer = tr
+	}
+}
+
 func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Snapshot) (err error) {
 	s.logger.Info("creating schema snapshot", loglib.Fields{"schemaTables": ss.SchemaTables})
 
@@ -196,7 +234,7 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 
 	// DUMP
 
-	dump, err := s.dumpSchema(ctx, dumpSchemas, ss.SchemaExcludedTables)
+	dump, err := s.dumpSchema(ctx, dumpSchemas, ss.SchemaExcludedTables, ss.SchemaExcludedViews)
 	if err != nil {
 		return err
 	}
@@ -238,14 +276,14 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 	}
 
 	s.logger.Info("restoring schema")
-	if err := s.restoreDump(ctx, dump.filtered); err != nil {
+	if err := s.restoreDump(ctx, dump.filtered, dump.enumTracker); err != nil {
 		return err
 	}
 
 	indicesAndConstraintsDump := dump.indicesAndConstraints
 	if s.generator != nil && s.restoreConflictTargetsBeforeData {
 		conflictTargets, remaining := splitConflictTargetConstraints(dump.indicesAndConstraints)
-		if err := s.restoreIndicesAndConstraints(ctx, conflictTargets, ss); err != nil {
+		if err := s.restoreIndicesAndConstraints(ctx, conflictTargets, ss, dump.enumTracker); err != nil {
 			return err
 		}
 		indicesAndConstraintsDump = remaining
@@ -267,12 +305,12 @@ func (s *SnapshotGenerator) CreateSnapshot(ctx context.Context, ss *snapshot.Sna
 		return err
 	}
 
-	if err := s.restoreIndicesAndConstraints(ctx, indicesAndConstraintsDump, ss); err != nil {
+	if err := s.restoreIndicesAndConstraints(ctx, indicesAndConstraintsDump, ss, dump.enumTracker); err != nil {
 		return err
 	}
 
 	s.logger.Info("restoring views")
-	return s.restoreDump(ctx, dump.views)
+	return s.restoreDump(ctx, dump.views, dump.enumTracker)
 }
 
 func splitConflictTargetConstraints(d []byte) ([]byte, []byte) {
@@ -324,12 +362,12 @@ func isConflictTargetConstraint(block string) bool {
 		strings.Contains(upperBlock, " UNIQUE USING INDEX ")
 }
 
-func (s *SnapshotGenerator) restoreIndicesAndConstraints(ctx context.Context, dump []byte, ss *snapshot.Snapshot) error {
+func (s *SnapshotGenerator) restoreIndicesAndConstraints(ctx context.Context, dump []byte, ss *snapshot.Snapshot, enumTracker ...*enumTypeTracker) error {
 	s.logger.Info("restoring schema indices and constraints", loglib.Fields{"schemaTables": ss.SchemaTables})
 	if s.snapshotTracker != nil {
-		return s.restoreIndicesWithTracking(ctx, dump)
+		return s.restoreIndicesWithTracking(ctx, dump, enumTracker...)
 	}
-	return s.restoreDump(ctx, dump)
+	return s.restoreDump(ctx, dump, enumTracker...)
 }
 
 func (s *SnapshotGenerator) Close() error {
@@ -354,8 +392,8 @@ func (s *SnapshotGenerator) Close() error {
 	return nil
 }
 
-func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables map[string][]string, excludedTables map[string][]string) (*dump, error) {
-	pgdumpOpts, err := s.optionGenerator.pgdumpOptions(ctx, schemaTables, excludedTables)
+func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables map[string][]string, excludedTables map[string][]string, excludedViews map[string][]string) (*dump, error) {
+	pgdumpOpts, err := s.optionGenerator.pgdumpOptions(ctx, schemaTables, excludedTables, excludedViews)
 	if err != nil {
 		return nil, fmt.Errorf("preparing pg_dump options: %w", err)
 	}
@@ -392,6 +430,12 @@ func (s *SnapshotGenerator) dumpSchema(ctx context.Context, schemaTables map[str
 		}
 		parsedDump.cleanupPart = getDumpsDiff(dumpWithCleanUp, d)
 		s.dumpToFile(s.getDumpFileName("-cleanup"), pgdumpOpts, parsedDump.cleanupPart)
+
+		// Filter out DROP SCHEMA and CREATE SCHEMA if configured
+		if s.excludeDropSchema {
+			s.logger.Debug("excluding DROP SCHEMA and CREATE SCHEMA from cleanup part")
+			parsedDump.cleanupPart = filterDropAndCreateSchema(parsedDump.cleanupPart)
+		}
 	}
 
 	return parsedDump, nil
@@ -465,9 +509,184 @@ func (s *SnapshotGenerator) restoreSchemas(ctx context.Context, schemaTables map
 	return s.restoreDump(ctx, []byte(schemaDump.String()))
 }
 
-func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte) error {
+// filterDropTypeStatements removes all DROP TYPE statements from the dump.
+// This is necessary when converting ENUMs to TEXT because:
+// 1. The ENUMs are converted to text
+// 2. The DROP TYPE statements would then try to drop "text" (after conversion)
+// 3. This fails because "text" is a system type
+func (s *SnapshotGenerator) filterDropTypeStatements(dump []byte) []byte {
+	scanner := bufio.NewScanner(bytes.NewReader(dump))
+	scanner.Split(bufio.ScanLines)
+	var result strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Skip DROP TYPE statements
+		if strings.HasPrefix(strings.TrimSpace(line), "DROP TYPE") {
+			continue
+		}
+
+		result.WriteString(line)
+		result.WriteString("\n")
+	}
+
+	return []byte(result.String())
+}
+
+// fixRenamedTextType fixes any incorrectly renamed "text" type back to "text".
+// After table renaming, patterns like "schema.text" might become "schema.piana_text",
+// which is incorrect since "text" is a PostgreSQL built-in type.
+func (s *SnapshotGenerator) fixRenamedTextType(dump []byte) []byte {
+	if s.tableRenamer == nil || !s.tableRenamer.HasRules() {
+		return dump
+	}
+
+	result := string(dump)
+
+	// The table renamer might have transformed "text" into various renamed forms
+	// We need to detect and fix these patterns
+	// Common patterns after renaming:
+	// - piana_text -> text
+	// - test_text -> text
+	// - prefix_text -> text
+
+	// Get the renaming pattern by applying it to a dummy "text" identifier
+	// This tells us what prefix is being added
+	dummyRenamed := s.tableRenamer.RenameTable("public", "text")
+
+	if dummyRenamed != "text" {
+		// The table renamer did rename "text", so we need to fix it
+		// Fix all possible quoting combinations
+		// Pattern 1: renamed_text (unquoted)
+		result = strings.ReplaceAll(result, " "+dummyRenamed+" ", " text ")
+		result = strings.ReplaceAll(result, " "+dummyRenamed+",", " text,")
+		result = strings.ReplaceAll(result, " "+dummyRenamed+";", " text;")
+		result = strings.ReplaceAll(result, " "+dummyRenamed+")", " text)")
+		result = strings.ReplaceAll(result, "("+dummyRenamed+" ", "(text ")
+		result = strings.ReplaceAll(result, "("+dummyRenamed+")", "(text)")
+
+		// Pattern 2: "renamed_text" (quoted)
+		result = strings.ReplaceAll(result, `"`+dummyRenamed+`"`, "text")
+
+		// Pattern 3: schema.renamed_text
+		result = strings.ReplaceAll(result, "."+dummyRenamed+" ", ".text ")
+		result = strings.ReplaceAll(result, "."+dummyRenamed+",", ".text,")
+		result = strings.ReplaceAll(result, "."+dummyRenamed+";", ".text;")
+		result = strings.ReplaceAll(result, "."+dummyRenamed+")", ".text)")
+		result = strings.ReplaceAll(result, "."+dummyRenamed+"[]", ".text[]")
+
+		// Pattern 4: schema."renamed_text"
+		result = strings.ReplaceAll(result, `."`+dummyRenamed+`"`, ".text")
+
+		// Pattern 5: "schema"."renamed_text"
+		result = strings.ReplaceAll(result, `"."`+dummyRenamed+`"`, `".text`)
+
+		// Pattern 6: renamed_text[] (array)
+		result = strings.ReplaceAll(result, dummyRenamed+"[]", "text[]")
+		result = strings.ReplaceAll(result, `"`+dummyRenamed+`"[]`, "text[]")
+	}
+
+	return []byte(result)
+}
+
+// convertEnumTypesInDump converts all tracked ENUM types to TEXT in the dump.
+// This is called AFTER table renaming to avoid the renamer accidentally renaming type names.
+func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *enumTypeTracker) []byte {
+	if tracker == nil || len(tracker.types) == 0 {
+		return dump
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(dump))
+	scanner.Split(bufio.ScanLines)
+	var result strings.Builder
+	inCreateTable := false
+	createTableBuffer := strings.Builder{}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Handle CREATE TABLE multi-line statements
+		if inCreateTable {
+			createTableBuffer.WriteString(line)
+			createTableBuffer.WriteString("\n")
+
+			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+				// End of CREATE TABLE - convert ENUMs in the whole statement
+				fullCreateTable := createTableBuffer.String()
+				convertedCreateTable := convertEnumColumnsToText(fullCreateTable, tracker)
+				result.WriteString(convertedCreateTable)
+				inCreateTable = false
+				createTableBuffer.Reset()
+			}
+			continue
+		}
+
+		// Detect start of CREATE TABLE
+		if strings.HasPrefix(line, "CREATE TABLE") {
+			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+				// Single-line CREATE TABLE (rare) - convert directly
+				converted := convertEnumColumnsToText(line+"\n", tracker)
+				result.WriteString(converted)
+			} else {
+				// Multi-line CREATE TABLE (common) - start buffering
+				inCreateTable = true
+				createTableBuffer.WriteString(line)
+				createTableBuffer.WriteString("\n")
+			}
+			continue
+		}
+
+		// Handle ALTER COLUMN TYPE statements (for ENUM conversion)
+		if strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "ALTER COLUMN") && strings.Contains(line, "TYPE") {
+			convertedLine := convertEnumTypeInAlterColumn(line, tracker)
+			result.WriteString(convertedLine)
+			result.WriteString("\n")
+			continue
+		}
+
+		// Convert ENUMs in all other lines (catch-all for type casts, defaults, etc.)
+		// This handles cases like:
+		// - DEFAULT 'value'::enum_type
+		// - Type casts in constraints
+		// - Any other ENUM references
+		convertedLine := convertEnumTypeInLine(line, tracker)
+		result.WriteString(convertedLine)
+		result.WriteString("\n")
+	}
+
+	return []byte(result.String())
+}
+
+func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte, enumTracker ...*enumTypeTracker) error {
 	if len(dump) == 0 {
 		return nil
+	}
+
+	// If ENUM conversion is enabled, remove DROP TYPE statements from the dump
+	// because after conversion they would try to drop "text" which is a system type
+	if s.convertEnumsToText {
+		dump = s.filterDropTypeStatements(dump)
+	}
+
+	// Apply ENUM to TEXT conversion BEFORE table renaming (if configured)
+	// This must happen BEFORE renaming to avoid complex pattern matching issues
+	if s.convertEnumsToText && len(enumTracker) > 0 && enumTracker[0] != nil {
+		// Pre-compute all replacement patterns once for performance
+		// This avoids regenerating patterns for every line in the dump
+		enumTracker[0].computeSortedPatterns()
+		s.logger.Info("converting ENUM types to TEXT", loglib.Fields{"enum_count": len(enumTracker[0].types), "pattern_count": len(enumTracker[0].sortedPatterns)})
+		dump = s.convertEnumTypesInDump(dump, enumTracker[0])
+	}
+
+	// Apply table renaming if configured
+	if s.tableRenamer != nil && s.tableRenamer.HasRules() {
+		s.logger.Info("applying table renaming to schema dump", loglib.Fields{"dump_size": len(dump)})
+		dump = s.tableRenamer.RenameInSQL(dump)
+
+		// IMPORTANT: After table renaming, the word "text" might have been renamed to "piana_text" etc.
+		// We need to fix this since "text" is a PostgreSQL built-in type and should not be renamed
+		dump = s.fixRenamedTextType(dump)
 	}
 
 	_, err := s.pgRestoreFn(ctx, s.optionGenerator.pgrestoreOptions(), dump)
@@ -500,8 +719,49 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 	alterTable := ""
 	createEventTrigger := ""
 	createView := ""
+	// Track CREATE TABLE for multi-line processing and constraint removal
+	inCreateTable := false
+	createTableBuffer := strings.Builder{}
+	// Track ENUM types for conversion to TEXT
+	var enumTracker *enumTypeTracker
+	if s.convertEnumsToText {
+		enumTracker = newEnumTypeTracker()
+	}
+
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Handle CREATE TABLE multi-line statements
+		if inCreateTable {
+			createTableBuffer.WriteString(line)
+			createTableBuffer.WriteString("\n")
+
+			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+				// End of CREATE TABLE
+				fullCreateTable := createTableBuffer.String()
+				cleanedCreateTable := s.cleanCreateTableConstraints(fullCreateTable)
+				filteredDump.WriteString(cleanedCreateTable)
+				inCreateTable = false
+				createTableBuffer.Reset()
+			}
+			continue
+		}
+
+		// Detect start of CREATE TABLE
+		if strings.HasPrefix(line, "CREATE TABLE") {
+			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+				// Single-line CREATE TABLE (rare)
+				cleanedLine := s.cleanCreateTableConstraints(line + "\n")
+				filteredDump.WriteString(cleanedLine)
+			} else {
+				// Multi-line CREATE TABLE (common)
+				inCreateTable = true
+				createTableBuffer.WriteString(line)
+				createTableBuffer.WriteString("\n")
+			}
+			continue
+		}
+
 		switch {
 		case strings.HasPrefix(line, "SECURITY LABEL") &&
 			isSecurityLabelForExcludedProvider(line, s.excludedSecurityLabels):
@@ -510,10 +770,16 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 		case alterTable != "":
 			// check if the previous alter table line is split in two lines and matches a constraint
 			if strings.Contains(line, "ADD CONSTRAINT") {
-				indicesAndConstraints.WriteString(alterTable)
-				indicesAndConstraints.WriteString("\n")
-				indicesAndConstraints.WriteString(line)
-				indicesAndConstraints.WriteString("\n\n")
+				// Reconstruct full constraint statement for checking
+				fullConstraintLine := alterTable + " " + line
+				if !s.shouldExcludeConstraint(fullConstraintLine) {
+					indicesAndConstraints.WriteString(alterTable)
+					indicesAndConstraints.WriteString("\n")
+					indicesAndConstraints.WriteString(line)
+					indicesAndConstraints.WriteString("\n\n")
+				} else {
+					s.logger.Debug("excluding constraint (multi-line)", loglib.Fields{"constraint": fullConstraintLine})
+				}
 				alterTable = ""
 			} else {
 				filteredDump.WriteString(alterTable)
@@ -538,6 +804,18 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 
 		case strings.HasPrefix(line, "CREATE VIEW"),
 			strings.HasPrefix(line, "CREATE MATERIALIZED VIEW"):
+			// Filter out views that match excluded_views patterns (wildcards only),
+			// matching the fork behaviour so excluded views never reach the views dump.
+			if s.shouldExcludeView(line) {
+				// Skip this view and all following lines until we hit a semicolon
+				for scanner.Scan() {
+					viewLine := scanner.Text()
+					if strings.HasSuffix(strings.TrimSpace(viewLine), ";") {
+						break
+					}
+				}
+				continue
+			}
 			createView = line
 			fallthrough
 		case createView != "":
@@ -557,17 +835,79 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			filteredDump.WriteString("\n")
 			viewsDump.WriteString(line)
 			viewsDump.WriteString("\n\n")
+		case strings.HasPrefix(line, "CREATE TYPE") && strings.Contains(line, "AS ENUM"):
+			// Handle CREATE TYPE AS ENUM
+			if s.convertEnumsToText && enumTracker != nil {
+				// Extract enum name and track it
+				enumName := extractEnumNameFromCreateType(line)
+				if enumName != "" {
+					enumTracker.add(enumName)
+				}
+				// Skip the entire CREATE TYPE statement (may be multi-line)
+				if !strings.HasSuffix(strings.TrimSpace(line), ";") {
+					// Multi-line ENUM, skip until semicolon
+					for scanner.Scan() {
+						nextLine := scanner.Text()
+						if strings.HasSuffix(strings.TrimSpace(nextLine), ";") {
+							break
+						}
+					}
+				}
+				// Don't write to filtered dump (skip ENUM creation)
+				continue
+			}
+			// If not converting ENUMs, keep the statement
+			filteredDump.WriteString(line)
+			filteredDump.WriteString("\n")
+		case strings.HasPrefix(line, "ALTER TYPE"):
+			// Handle ALTER TYPE statements
+			if s.convertEnumsToText && enumTracker != nil {
+				// Check if it's an ENUM type being altered
+				if strings.Contains(line, "ADD VALUE") || strings.Contains(line, "RENAME VALUE") {
+					// This is ENUM-specific, skip it
+					continue
+				}
+				// ALTER TYPE RENAME TO is not ENUM-specific, but check if it's an ENUM
+				if strings.Contains(line, "RENAME TO") && isAlterTypeForEnum(line, enumTracker) {
+					// Skip renaming ENUM types as they won't exist
+					continue
+				}
+			}
+			// Keep non-ENUM ALTER TYPE or if not converting
+			filteredDump.WriteString(line)
+			filteredDump.WriteString("\n")
+		case strings.HasPrefix(line, "CREATE TRIGGER") || strings.HasPrefix(line, "CREATE CONSTRAINT TRIGGER"):
+			if !s.excludeTriggers {
+				s.logger.Debug("including trigger", loglib.Fields{"line": line})
+				indicesAndConstraints.WriteString(line)
+				indicesAndConstraints.WriteString("\n\n")
+			} else {
+				s.logger.Debug("excluding trigger", loglib.Fields{"line": line})
+			}
 		case strings.HasPrefix(line, "CREATE INDEX"),
 			strings.HasPrefix(line, "CREATE UNIQUE INDEX"),
 			strings.HasPrefix(line, "CREATE CONSTRAINT"),
-			strings.HasPrefix(line, "CREATE TRIGGER"),
 			strings.HasPrefix(line, "COMMENT ON CONSTRAINT"),
-			strings.HasPrefix(line, "COMMENT ON INDEX"),
-			strings.HasPrefix(line, "COMMENT ON TRIGGER"):
+			strings.HasPrefix(line, "COMMENT ON INDEX"):
 			indicesAndConstraints.WriteString(line)
 			indicesAndConstraints.WriteString("\n\n")
+		case strings.HasPrefix(line, "COMMENT ON TRIGGER"):
+			if !s.excludeTriggers {
+				indicesAndConstraints.WriteString(line)
+				indicesAndConstraints.WriteString("\n\n")
+			}
 		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "ADD CONSTRAINT"):
-			indicesAndConstraints.WriteString(line)
+			if !s.shouldExcludeConstraint(line) {
+				indicesAndConstraints.WriteString(line)
+			}
+		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "ALTER COLUMN") && strings.Contains(line, "TYPE"):
+			// Handle ALTER TABLE ... ALTER COLUMN ... TYPE
+			convertedLine := line
+			if s.convertEnumsToText && enumTracker != nil {
+				convertedLine = convertEnumTypeInAlterColumn(line, enumTracker)
+			}
+			filteredDump.WriteString(convertedLine)
+			filteredDump.WriteString("\n")
 		case strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "REPLICA IDENTITY"):
 			// REPLICA IDENTITY lines should be in the indicesAndConstraints section
 			// since they reference constraints/indices that are also there
@@ -576,6 +916,20 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 		case strings.HasPrefix(line, "ALTER TABLE") && !strings.HasSuffix(line, ";"):
 			// keep it in case the alter table is provided in two lines (pg_dump format)
 			alterTable = line
+		case strings.HasPrefix(line, "CREATE VIEW") || strings.HasPrefix(line, "CREATE OR REPLACE VIEW"):
+			// Filter out views that match excluded_views patterns (wildcards only)
+			if s.shouldExcludeView(line) {
+				// Skip this view and all following lines until we hit a semicolon
+				for scanner.Scan() {
+					viewLine := scanner.Text()
+					if strings.HasSuffix(strings.TrimSpace(viewLine), ";") {
+						break
+					}
+				}
+				continue
+			}
+			filteredDump.WriteString(line)
+			filteredDump.WriteString("\n")
 		case strings.HasPrefix(line, "CREATE SEQUENCE"):
 			qualifiedName, err := pglib.NewQualifiedName(strings.TrimPrefix(line, "CREATE SEQUENCE "))
 			if err == nil {
@@ -583,7 +937,22 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			}
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
+		case strings.HasPrefix(line, "DROP SCHEMA"):
+			// Skip DROP SCHEMA if exclude_drop_schema is enabled, otherwise include it
+			if !s.excludeDropSchema {
+				filteredDump.WriteString(line)
+				filteredDump.WriteString("\n")
+			}
+		case strings.HasPrefix(line, "CREATE SCHEMA"):
+			// Skip CREATE SCHEMA if exclude_drop_schema is enabled, otherwise include it
+			if !s.excludeDropSchema {
+				filteredDump.WriteString(line)
+				filteredDump.WriteString("\n")
+			}
 		case isRoleStatement(line):
+			// Skip ALTER SCHEMA OWNER TO if exclude_drop_schema is enabled
+			isAlterSchemaOwner := strings.HasPrefix(line, "ALTER SCHEMA") && strings.Contains(line, "OWNER TO")
+
 			roles := s.roleSQLParser.extractRoleNamesFromLine(line)
 			if hasExcludedRole(roles) {
 				// if any of the roles is excluded or predefined, skip the whole line
@@ -607,9 +976,12 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 				}
 			}
 
+			if isAlterSchemaOwner && s.excludeDropSchema {
+				continue
+			}
+
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
-
 		default:
 			filteredDump.WriteString(line)
 			filteredDump.WriteString("\n")
@@ -625,6 +997,7 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 		sequences:             sequenceNames,
 		roles:                 dumpRoles,
 		eventTriggers:         []byte(eventTriggersDump.String()),
+		enumTracker:           enumTracker,
 	}
 }
 
@@ -753,7 +1126,7 @@ func (s *SnapshotGenerator) getDumpFileName(suffix string) string {
 	return baseName + suffix + fileExtension
 }
 
-func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, dump []byte) error {
+func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, dump []byte, enumTracker ...*enumTypeTracker) error {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	trackingCtx, cancel := context.WithCancel(ctx)
@@ -762,7 +1135,7 @@ func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, dump
 		defer wg.Done()
 		s.snapshotTracker.trackIndexesCreation(trackingCtx)
 	}()
-	err := s.restoreDump(ctx, dump)
+	err := s.restoreDump(ctx, dump, enumTracker...)
 	// wait for the tracking to finish once the restore is done
 	cancel()
 	wg.Wait()
@@ -775,6 +1148,256 @@ func hasWildcardTable(tables []string) bool {
 
 func hasWildcardSchema(schemaTables map[string][]string) bool {
 	return schemaTables[wildcard] != nil
+}
+
+// shouldExcludeView checks if a CREATE VIEW statement should be excluded
+// based on the excluded_views configuration (only wildcards are checked here,
+// specific views are excluded by pg_dump --exclude-table)
+func (s *SnapshotGenerator) shouldExcludeView(line string) bool {
+	if s.excludedViews == nil || len(s.excludedViews) == 0 {
+		return false
+	}
+
+	// Extract view name from "CREATE VIEW schema.viewname" or "CREATE OR REPLACE VIEW schema.viewname"
+	viewPrefix := "CREATE VIEW "
+	if strings.HasPrefix(line, "CREATE OR REPLACE VIEW") {
+		viewPrefix = "CREATE OR REPLACE VIEW "
+	}
+
+	viewNamePart := strings.TrimPrefix(line, viewPrefix)
+	viewNamePart = strings.TrimSpace(viewNamePart)
+	// Extract just the qualified name (before AS or any other clause)
+	if idx := strings.Index(viewNamePart, " "); idx > 0 {
+		viewNamePart = viewNamePart[:idx]
+	}
+
+	qualifiedName, err := pglib.NewQualifiedName(viewNamePart)
+	if err != nil {
+		s.logger.Debug("failed to parse view name from line", loglib.Fields{"line": line, "error": err})
+		return false
+	}
+
+	s.logger.Debug("checking view against excludedViews", loglib.Fields{
+		"view":          qualifiedName.String(),
+		"schema":        qualifiedName.Schema(),
+		"excludedViews": s.excludedViews,
+	})
+
+	// Check if this view matches any wildcard exclusion pattern
+	if views, ok := s.excludedViews[qualifiedName.Schema()]; ok {
+		s.logger.Debug("found schema in excludedViews", loglib.Fields{"schema": qualifiedName.Schema(), "views": views})
+		if hasWildcardTable(views) {
+			// Wildcard exclusion for this schema
+			s.logger.Debug("excluding view due to wildcard match", loglib.Fields{"view": qualifiedName.String()})
+			return true
+		}
+	}
+
+	s.logger.Debug("not excluding view", loglib.Fields{"view": qualifiedName.String()})
+	return false
+}
+
+// shouldExcludeConstraint checks if an ALTER TABLE ADD CONSTRAINT should be excluded
+// based on exclude_check_constraints and exclude_foreign_keys configuration
+func (s *SnapshotGenerator) shouldExcludeConstraint(line string) bool {
+	// Never exclude PRIMARY KEY (critical for replication)
+	if strings.Contains(line, "PRIMARY KEY") {
+		s.logger.Debug("not excluding PRIMARY KEY constraint", loglib.Fields{"line": line})
+		return false
+	}
+
+	// Never exclude UNIQUE constraints (critical for replication)
+	// Note: Check that it's not part of a FOREIGN KEY UNIQUE combo
+	if strings.Contains(line, "UNIQUE") && !strings.Contains(line, "FOREIGN KEY") {
+		s.logger.Debug("not excluding UNIQUE constraint", loglib.Fields{"line": line})
+		return false
+	}
+
+	// Check for CHECK constraints
+	if s.excludeCheckConstraints {
+		if strings.Contains(line, "CHECK (") || strings.Contains(line, "CHECK(") {
+			s.logger.Debug("excluding CHECK constraint", loglib.Fields{"line": line})
+			return true
+		}
+	}
+
+	// Check for FOREIGN KEY constraints
+	if s.excludeForeignKeys {
+		if strings.Contains(line, "FOREIGN KEY") {
+			s.logger.Debug("excluding FOREIGN KEY constraint", loglib.Fields{"line": line})
+			return true
+		}
+	}
+
+	return false
+}
+
+// cleanCreateTableConstraints removes inline constraints from CREATE TABLE statements
+// using a robust parser that handles nested parentheses
+func (s *SnapshotGenerator) cleanCreateTableConstraints(createTableSQL string) string {
+	if !s.excludeCheckConstraints && !s.excludeForeignKeys {
+		return createTableSQL
+	}
+
+	result := createTableSQL
+
+	// Remove inline CHECK constraints (with robust parentheses handling)
+	if s.excludeCheckConstraints {
+		result = s.removeInlineCheckConstraints(result)
+	}
+
+	// Remove inline FOREIGN KEY references (simple pattern, no ON DELETE/UPDATE)
+	if s.excludeForeignKeys {
+		result = s.removeInlineForeignKeys(result)
+	}
+
+	return result
+}
+
+// removeInlineCheckConstraints removes CHECK constraints from CREATE TABLE
+// using a character-by-character parser to handle nested parentheses correctly
+func (s *SnapshotGenerator) removeInlineCheckConstraints(sql string) string {
+	result := strings.Builder{}
+	i := 0
+
+	for i < len(sql) {
+		// Look for "CONSTRAINT name CHECK (" or just "CHECK ("
+		checkIdx := -1
+		isNamed := false
+		constraintStartRelative := -1 // Store where CONSTRAINT starts relative to i
+
+		// Look for anonymous CHECK first
+		anonCheckIdx := strings.Index(strings.ToUpper(sql[i:]), " CHECK ")
+
+		// Look for named CONSTRAINT ... CHECK
+		constraintIdx := strings.Index(strings.ToUpper(sql[i:]), "CONSTRAINT ")
+		var namedCheckIdx int = -1
+		if constraintIdx != -1 {
+			// Check if there's a CHECK after this CONSTRAINT
+			afterConstraint := constraintIdx + 11 // len("CONSTRAINT ")
+			remainingUpper := strings.ToUpper(sql[i+afterConstraint:])
+
+			// Find the constraint name end (next space or CHECK keyword)
+			nameEnd := strings.Index(remainingUpper, " CHECK ")
+			if nameEnd != -1 {
+				namedCheckIdx = i + afterConstraint + nameEnd + 1 // +1 for the space
+				constraintStartRelative = constraintIdx           // Store where CONSTRAINT keyword starts
+			}
+		}
+
+		// Choose whichever comes first: anonymous CHECK or named CONSTRAINT CHECK
+		// Note: anonCheckIdx points to the space before CHECK, so we need to add 1 for comparison
+		if anonCheckIdx != -1 && (namedCheckIdx == -1 || (i+anonCheckIdx+1) < namedCheckIdx) {
+			// Anonymous CHECK comes first (or is the only one)
+			checkIdx = i + anonCheckIdx + 1 // +1 to include the leading space
+			isNamed = false
+		} else if namedCheckIdx != -1 {
+			// Named CONSTRAINT CHECK comes first (or is the only one)
+			checkIdx = namedCheckIdx
+			isNamed = true
+		}
+
+		// No CHECK found, copy the rest and done
+		if checkIdx == -1 {
+			result.WriteString(sql[i:])
+			break
+		}
+
+		// Copy everything before the CHECK (or CONSTRAINT if named)
+		if isNamed && constraintStartRelative != -1 {
+			// Copy up to CONSTRAINT keyword
+			copyUntil := i + constraintStartRelative
+			// Trim trailing space before CONSTRAINT
+			beforeConstraint := sql[i:copyUntil]
+			beforeConstraint = strings.TrimRight(beforeConstraint, " \t")
+			result.WriteString(beforeConstraint)
+			s.logger.Debug("removing inline CHECK constraint (named)", loglib.Fields{"position": checkIdx})
+		} else {
+			result.WriteString(sql[i:checkIdx])
+			s.logger.Debug("removing inline CHECK constraint (anonymous)", loglib.Fields{"position": checkIdx})
+		}
+
+		// Find the opening parenthesis after CHECK
+		checkKeywordEnd := checkIdx + 6 // len(" CHECK")
+		openParenPos := strings.Index(sql[checkKeywordEnd:], "(")
+		if openParenPos == -1 {
+			// Malformed, just skip CHECK keyword and continue
+			result.WriteString(sql[checkIdx:checkKeywordEnd])
+			i = checkKeywordEnd
+			continue
+		}
+
+		// Start parsing from the opening parenthesis
+		startPos := checkKeywordEnd + openParenPos
+		parenCount := 0
+		endPos := startPos
+
+		// Count parentheses to find the matching closing parenthesis
+		for endPos < len(sql) {
+			if sql[endPos] == '(' {
+				parenCount++
+			} else if sql[endPos] == ')' {
+				parenCount--
+				if parenCount == 0 {
+					// Found the matching closing parenthesis
+					endPos++
+					break
+				}
+			}
+			endPos++
+		}
+
+		// Skip past the CHECK constraint (don't write it to result)
+		i = endPos
+
+		// Clean up any trailing comma/space after removed constraint
+		hasCommaAfter := false
+		whitespaceAfter := 0
+		for i < len(sql) && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n') {
+			i++
+			whitespaceAfter++
+		}
+		if i < len(sql) && sql[i] == ',' {
+			hasCommaAfter = true
+			i++ // skip trailing comma
+			// Also skip whitespace after comma
+			for i < len(sql) && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n') {
+				i++
+			}
+		}
+
+		// If no comma after, check if we need to clean a trailing comma before
+		// This handles the case: "col1 INT, CHECK(...)" where we need to remove the comma before CHECK
+		if !hasCommaAfter {
+			// Look back in result to remove trailing comma if present
+			resultStr := result.String()
+			trimmed := strings.TrimRight(resultStr, " \t\n")
+			if strings.HasSuffix(trimmed, ",") {
+				// Remove the trailing comma
+				trimmed = trimmed[:len(trimmed)-1]
+				// Reset result builder with trimmed content
+				result.Reset()
+				result.WriteString(trimmed)
+			}
+		}
+	}
+
+	return result.String()
+}
+
+// removeInlineForeignKeys removes REFERENCES clauses from CREATE TABLE
+// Simple pattern matching - does not handle ON DELETE/ON UPDATE (as per requirement)
+func (s *SnapshotGenerator) removeInlineForeignKeys(sql string) string {
+	// Pattern: REFERENCES table_name(column_name)
+	// Simplified regex for basic REFERENCES without ON DELETE/UPDATE
+	referencesPattern := regexp.MustCompile(`(?i)\s+REFERENCES\s+[a-zA-Z_][a-zA-Z0-9_.]*\s*\([^)]*\)`)
+
+	matches := referencesPattern.FindAllStringIndex(sql, -1)
+	if len(matches) > 0 {
+		s.logger.Debug("removing inline FOREIGN KEY references", loglib.Fields{"count": len(matches)})
+	}
+
+	return referencesPattern.ReplaceAllString(sql, "")
 }
 
 // returns all the lines of d1 that are not in d2
@@ -795,6 +1418,59 @@ func getDumpsDiff(d1, d2 []byte) []byte {
 	}
 
 	return []byte(diff.String())
+}
+
+// filterDropAndCreateSchema removes DROP SCHEMA, CREATE SCHEMA, and ALTER SCHEMA OWNER TO
+// statements from the cleanup dump. This is useful when schemas should already exist in the
+// target database and should not be dropped or recreated.
+func filterDropAndCreateSchema(cleanup []byte) []byte {
+	scanner := bufio.NewScanner(bytes.NewReader(cleanup))
+	scanner.Split(bufio.ScanLines)
+	var filtered strings.Builder
+	skipUntilSemicolon := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmedLine := strings.TrimSpace(line)
+
+		// If we're in the middle of a multi-line statement, continue skipping
+		if skipUntilSemicolon {
+			if strings.HasSuffix(trimmedLine, ";") {
+				skipUntilSemicolon = false
+			}
+			continue
+		}
+
+		// Detect DROP SCHEMA statements (with IF EXISTS and/or CASCADE)
+		if strings.HasPrefix(line, "DROP SCHEMA") {
+			if !strings.HasSuffix(trimmedLine, ";") {
+				skipUntilSemicolon = true
+			}
+			continue
+		}
+
+		// Detect CREATE SCHEMA statements
+		if strings.HasPrefix(line, "CREATE SCHEMA") {
+			if !strings.HasSuffix(trimmedLine, ";") {
+				skipUntilSemicolon = true
+			}
+			continue
+		}
+
+		// Skip ALTER SCHEMA OWNER TO statements (often follows CREATE SCHEMA)
+		if strings.HasPrefix(line, "ALTER SCHEMA") && strings.Contains(line, "OWNER TO") {
+			if !strings.HasSuffix(trimmedLine, ";") {
+				skipUntilSemicolon = true
+			}
+			continue
+		}
+
+		// Keep all other lines
+		filtered.WriteString(line)
+		filtered.WriteString("\n")
+	}
+
+	return []byte(filtered.String())
 }
 
 func isSecurityLabelForExcludedProvider(line string, excludedProviders []string) bool {

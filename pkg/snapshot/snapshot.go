@@ -5,6 +5,7 @@ package snapshot
 type Snapshot struct {
 	SchemaTables         map[string][]string
 	SchemaExcludedTables map[string][]string
+	SchemaExcludedViews  map[string][]string
 }
 
 type Request struct {

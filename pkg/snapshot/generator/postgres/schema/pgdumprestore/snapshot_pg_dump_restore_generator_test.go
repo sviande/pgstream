@@ -1395,6 +1395,7 @@ func TestSnapshotGenerator_parseDump(t *testing.T) {
 
 	sg := &SnapshotGenerator{
 		excludedSecurityLabels: []string{"anon"},
+		logger:                 log.NewNoopLogger(),
 	}
 	dump := sg.parseDump(dumpBytes)
 

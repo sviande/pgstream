@@ -531,6 +531,7 @@ func TestOptionsGenerator_pgdumpOptions(t *testing.T) {
 				context.Background(),
 				tc.schemaTables,
 				tc.excludedTables,
+				nil,
 			)
 			require.ErrorIs(t, err, tc.wantErr)
 			require.Equal(t, tc.wantOpts, opts)
