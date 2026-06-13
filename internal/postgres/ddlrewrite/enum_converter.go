@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package pgdumprestore
+// Package ddlrewrite provides shared helpers to rewrite raw PostgreSQL DDL/SQL
+// so that ENUM types are converted to TEXT. It is used both by the schema
+// snapshot generator (rewriting the pg_dump output) and by the CDC DDL adapter
+// (rewriting the raw DDL captured from the replication stream), so that a table
+// created via snapshot and the same table created via live DDL replication end
+// up identical on the target.
+package ddlrewrite
 
 import (
 	"bufio"
@@ -11,8 +17,8 @@ import (
 	pglib "github.com/xataio/pgstream/internal/postgres"
 )
 
-// enumTypeTracker tracks ENUM types found in the dump
-type enumTypeTracker struct {
+// EnumTypeTracker tracks ENUM types found in the dump/DDL stream.
+type EnumTypeTracker struct {
 	types            map[string]bool // "schema.typename" or "typename" -> true
 	sortedPatterns   []patternInfo   // Pre-computed patterns sorted by length (longest first)
 	patternsComputed bool            // Track if patterns have been computed
@@ -27,15 +33,17 @@ type patternInfo struct {
 	alterTypeSimpleRe *regexp.Regexp // Pre-compiled regex for ALTER COLUMN TYPE simple
 }
 
-func newEnumTypeTracker() *enumTypeTracker {
-	return &enumTypeTracker{
+func NewEnumTypeTracker() *EnumTypeTracker {
+	return &EnumTypeTracker{
 		types:            make(map[string]bool),
 		sortedPatterns:   nil,
 		patternsComputed: false,
 	}
 }
 
-func (et *enumTypeTracker) add(typeName string) {
+// Add registers an ENUM type name (in all its qualified/unqualified/quoted
+// variants). Adding a type invalidates any previously computed patterns.
+func (et *EnumTypeTracker) Add(typeName string) {
 	// Add the original name
 	et.types[typeName] = true
 
@@ -49,15 +57,44 @@ func (et *enumTypeTracker) add(typeName string) {
 		et.types[typeNameOnly] = true
 		et.types[`"`+typeNameOnly+`"`] = true
 	}
+
+	// new types invalidate the pre-computed patterns
+	et.patternsComputed = false
+	et.sortedPatterns = nil
 }
 
-func (et *enumTypeTracker) isEnum(typeName string) bool {
+// Remove drops an ENUM type name (all variants) from the tracker.
+func (et *EnumTypeTracker) Remove(typeName string) {
+	cleanName := strings.Trim(typeName, `"`)
+	delete(et.types, typeName)
+	delete(et.types, cleanName)
+	delete(et.types, `"`+cleanName+`"`)
+	if idx := strings.LastIndex(cleanName, "."); idx != -1 {
+		typeNameOnly := cleanName[idx+1:]
+		delete(et.types, typeNameOnly)
+		delete(et.types, `"`+typeNameOnly+`"`)
+	}
+	et.patternsComputed = false
+	et.sortedPatterns = nil
+}
+
+func (et *EnumTypeTracker) IsEnum(typeName string) bool {
 	return pglib.IsEnumType(typeName, et.types)
 }
 
-// computeSortedPatterns pre-computes all replacement patterns and sorts them by length
-// This is called once after all ENUMs have been added to the tracker
-func (et *enumTypeTracker) computeSortedPatterns() {
+// TypeCount returns the number of tracked type-name variants.
+func (et *EnumTypeTracker) TypeCount() int {
+	return len(et.types)
+}
+
+// PatternCount returns the number of pre-computed replacement patterns.
+func (et *EnumTypeTracker) PatternCount() int {
+	return len(et.sortedPatterns)
+}
+
+// ComputeSortedPatterns pre-computes all replacement patterns and sorts them by
+// length. It is called once after all ENUMs have been added to the tracker.
+func (et *EnumTypeTracker) ComputeSortedPatterns() {
 	if et.patternsComputed {
 		return // Already computed
 	}
@@ -163,12 +200,12 @@ func parseSchemaAndType(qualifiedName string) (schema, typeName string) {
 	return schema, typeName
 }
 
-// extractEnumNameFromCreateType extracts the type name from a CREATE TYPE AS ENUM statement
+// ExtractEnumNameFromCreateType extracts the type name from a CREATE TYPE AS ENUM statement
 // Examples:
 //   - "CREATE TYPE public.status AS ENUM" -> "public.status"
 //   - "CREATE TYPE status AS ENUM" -> "status"
 //   - "CREATE TYPE \"my-enum\" AS ENUM" -> "\"my-enum\""
-func extractEnumNameFromCreateType(line string) string {
+func ExtractEnumNameFromCreateType(line string) string {
 	matches := createTypeRegex.FindStringSubmatch(line)
 	if len(matches) > 1 {
 		return matches[1]
@@ -176,9 +213,9 @@ func extractEnumNameFromCreateType(line string) string {
 	return ""
 }
 
-// collectMultiLineStatement collects lines from scanner until a semicolon is found
+// CollectMultiLineStatement collects lines from scanner until a semicolon is found
 // Returns the complete statement as a single string
-func collectMultiLineStatement(scanner *bufio.Scanner, firstLine string) string {
+func CollectMultiLineStatement(scanner *bufio.Scanner, firstLine string) string {
 	var buffer strings.Builder
 	buffer.WriteString(firstLine)
 	buffer.WriteString("\n")
@@ -202,9 +239,9 @@ func collectMultiLineStatement(scanner *bufio.Scanner, firstLine string) string 
 	return buffer.String()
 }
 
-// convertEnumColumnsToText converts ENUM column types to TEXT in a CREATE TABLE statement
+// ConvertEnumColumnsToText converts ENUM column types to TEXT in a CREATE TABLE statement
 // It handles both simple and array ENUM types
-func convertEnumColumnsToText(createTableSQL string, tracker *enumTypeTracker) string {
+func ConvertEnumColumnsToText(createTableSQL string, tracker *EnumTypeTracker) string {
 	if tracker == nil || len(tracker.types) == 0 {
 		return createTableSQL
 	}
@@ -228,7 +265,7 @@ func convertEnumColumnsToText(createTableSQL string, tracker *enumTypeTracker) s
 		}
 
 		// Try to parse column definition
-		convertedLine := convertEnumTypeInLine(line, tracker)
+		convertedLine := ConvertEnumTypeInLine(line, tracker)
 		result.WriteString(convertedLine)
 		result.WriteString("\n")
 	}
@@ -236,16 +273,16 @@ func convertEnumColumnsToText(createTableSQL string, tracker *enumTypeTracker) s
 	return strings.TrimRight(result.String(), "\n")
 }
 
-// convertEnumTypeInLine converts ENUM types to TEXT in a single line
+// ConvertEnumTypeInLine converts ENUM types to TEXT in a single line
 // Handles column definitions, DEFAULT values with casts, etc.
-func convertEnumTypeInLine(line string, tracker *enumTypeTracker) string {
+func ConvertEnumTypeInLine(line string, tracker *EnumTypeTracker) string {
 	if tracker == nil {
 		return line
 	}
 
 	// Ensure patterns are computed (done once)
 	if !tracker.patternsComputed {
-		tracker.computeSortedPatterns()
+		tracker.ComputeSortedPatterns()
 	}
 
 	result := line
@@ -283,18 +320,18 @@ func convertEnumTypeInLine(line string, tracker *enumTypeTracker) string {
 	return result
 }
 
-// convertEnumTypeInAlterColumn converts ENUM type to TEXT in ALTER COLUMN TYPE statements
+// ConvertEnumTypeInAlterColumn converts ENUM type to TEXT in ALTER COLUMN TYPE statements
 // Example: "ALTER TABLE users ALTER COLUMN status TYPE public.status"
 //
 //	-> "ALTER TABLE users ALTER COLUMN status TYPE text"
-func convertEnumTypeInAlterColumn(alterSQL string, tracker *enumTypeTracker) string {
+func ConvertEnumTypeInAlterColumn(alterSQL string, tracker *EnumTypeTracker) string {
 	if tracker == nil || len(tracker.types) == 0 {
 		return alterSQL
 	}
 
 	// Ensure patterns are computed (done once)
 	if !tracker.patternsComputed {
-		tracker.computeSortedPatterns()
+		tracker.ComputeSortedPatterns()
 	}
 
 	// Pattern: ALTER TABLE ... ALTER COLUMN ... TYPE <type>
@@ -320,8 +357,8 @@ func convertEnumTypeInAlterColumn(alterSQL string, tracker *enumTypeTracker) str
 	return result
 }
 
-// isAlterTypeForEnum checks if an ALTER TYPE statement is for an ENUM type
-func isAlterTypeForEnum(line string, tracker *enumTypeTracker) bool {
+// IsAlterTypeForEnum checks if an ALTER TYPE statement is for an ENUM type
+func IsAlterTypeForEnum(line string, tracker *EnumTypeTracker) bool {
 	if tracker == nil {
 		return false
 	}
@@ -330,7 +367,7 @@ func isAlterTypeForEnum(line string, tracker *enumTypeTracker) bool {
 	matches := alterTypeRegex.FindStringSubmatch(line)
 	if len(matches) > 1 {
 		typeName := matches[1]
-		return tracker.isEnum(typeName)
+		return tracker.IsEnum(typeName)
 	}
 
 	return false

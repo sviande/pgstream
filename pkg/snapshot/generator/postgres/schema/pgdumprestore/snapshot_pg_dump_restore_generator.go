@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	pglib "github.com/xataio/pgstream/internal/postgres"
+	"github.com/xataio/pgstream/internal/postgres/ddlrewrite"
 	pglibinstrumentation "github.com/xataio/pgstream/internal/postgres/instrumentation"
 	loglib "github.com/xataio/pgstream/pkg/log"
 	"github.com/xataio/pgstream/pkg/otel"
@@ -107,7 +108,7 @@ type dump struct {
 	indicesAndConstraints []byte
 	views                 []byte
 	sequences             []string
-	enumTracker           *enumTypeTracker // Tracks ENUM types for conversion after table renaming
+	enumTracker           *ddlrewrite.EnumTypeTracker // Tracks ENUM types for conversion after table renaming
 	roles                 map[string]role
 	eventTriggers         []byte
 }
@@ -362,7 +363,7 @@ func isConflictTargetConstraint(block string) bool {
 		strings.Contains(upperBlock, " UNIQUE USING INDEX ")
 }
 
-func (s *SnapshotGenerator) restoreIndicesAndConstraints(ctx context.Context, dump []byte, ss *snapshot.Snapshot, enumTracker ...*enumTypeTracker) error {
+func (s *SnapshotGenerator) restoreIndicesAndConstraints(ctx context.Context, dump []byte, ss *snapshot.Snapshot, enumTracker ...*ddlrewrite.EnumTypeTracker) error {
 	s.logger.Info("restoring schema indices and constraints", loglib.Fields{"schemaTables": ss.SchemaTables})
 	if s.snapshotTracker != nil {
 		return s.restoreIndicesWithTracking(ctx, dump, enumTracker...)
@@ -592,8 +593,8 @@ func (s *SnapshotGenerator) fixRenamedTextType(dump []byte) []byte {
 
 // convertEnumTypesInDump converts all tracked ENUM types to TEXT in the dump.
 // This is called AFTER table renaming to avoid the renamer accidentally renaming type names.
-func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *enumTypeTracker) []byte {
-	if tracker == nil || len(tracker.types) == 0 {
+func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *ddlrewrite.EnumTypeTracker) []byte {
+	if tracker == nil || tracker.TypeCount() == 0 {
 		return dump
 	}
 
@@ -614,7 +615,7 @@ func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *enumTyp
 			if strings.HasSuffix(strings.TrimSpace(line), ");") {
 				// End of CREATE TABLE - convert ENUMs in the whole statement
 				fullCreateTable := createTableBuffer.String()
-				convertedCreateTable := convertEnumColumnsToText(fullCreateTable, tracker)
+				convertedCreateTable := ddlrewrite.ConvertEnumColumnsToText(fullCreateTable, tracker)
 				result.WriteString(convertedCreateTable)
 				inCreateTable = false
 				createTableBuffer.Reset()
@@ -626,7 +627,7 @@ func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *enumTyp
 		if strings.HasPrefix(line, "CREATE TABLE") {
 			if strings.HasSuffix(strings.TrimSpace(line), ");") {
 				// Single-line CREATE TABLE (rare) - convert directly
-				converted := convertEnumColumnsToText(line+"\n", tracker)
+				converted := ddlrewrite.ConvertEnumColumnsToText(line+"\n", tracker)
 				result.WriteString(converted)
 			} else {
 				// Multi-line CREATE TABLE (common) - start buffering
@@ -639,7 +640,7 @@ func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *enumTyp
 
 		// Handle ALTER COLUMN TYPE statements (for ENUM conversion)
 		if strings.HasPrefix(line, "ALTER TABLE") && strings.Contains(line, "ALTER COLUMN") && strings.Contains(line, "TYPE") {
-			convertedLine := convertEnumTypeInAlterColumn(line, tracker)
+			convertedLine := ddlrewrite.ConvertEnumTypeInAlterColumn(line, tracker)
 			result.WriteString(convertedLine)
 			result.WriteString("\n")
 			continue
@@ -650,7 +651,7 @@ func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *enumTyp
 		// - DEFAULT 'value'::enum_type
 		// - Type casts in constraints
 		// - Any other ENUM references
-		convertedLine := convertEnumTypeInLine(line, tracker)
+		convertedLine := ddlrewrite.ConvertEnumTypeInLine(line, tracker)
 		result.WriteString(convertedLine)
 		result.WriteString("\n")
 	}
@@ -658,7 +659,7 @@ func (s *SnapshotGenerator) convertEnumTypesInDump(dump []byte, tracker *enumTyp
 	return []byte(result.String())
 }
 
-func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte, enumTracker ...*enumTypeTracker) error {
+func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte, enumTracker ...*ddlrewrite.EnumTypeTracker) error {
 	if len(dump) == 0 {
 		return nil
 	}
@@ -674,8 +675,8 @@ func (s *SnapshotGenerator) restoreDump(ctx context.Context, dump []byte, enumTr
 	if s.convertEnumsToText && len(enumTracker) > 0 && enumTracker[0] != nil {
 		// Pre-compute all replacement patterns once for performance
 		// This avoids regenerating patterns for every line in the dump
-		enumTracker[0].computeSortedPatterns()
-		s.logger.Info("converting ENUM types to TEXT", loglib.Fields{"enum_count": len(enumTracker[0].types), "pattern_count": len(enumTracker[0].sortedPatterns)})
+		enumTracker[0].ComputeSortedPatterns()
+		s.logger.Info("converting ENUM types to TEXT", loglib.Fields{"enum_count": enumTracker[0].TypeCount(), "pattern_count": enumTracker[0].PatternCount()})
 		dump = s.convertEnumTypesInDump(dump, enumTracker[0])
 	}
 
@@ -723,9 +724,9 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 	inCreateTable := false
 	createTableBuffer := strings.Builder{}
 	// Track ENUM types for conversion to TEXT
-	var enumTracker *enumTypeTracker
+	var enumTracker *ddlrewrite.EnumTypeTracker
 	if s.convertEnumsToText {
-		enumTracker = newEnumTypeTracker()
+		enumTracker = ddlrewrite.NewEnumTypeTracker()
 	}
 
 	for scanner.Scan() {
@@ -839,9 +840,9 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			// Handle CREATE TYPE AS ENUM
 			if s.convertEnumsToText && enumTracker != nil {
 				// Extract enum name and track it
-				enumName := extractEnumNameFromCreateType(line)
+				enumName := ddlrewrite.ExtractEnumNameFromCreateType(line)
 				if enumName != "" {
-					enumTracker.add(enumName)
+					enumTracker.Add(enumName)
 				}
 				// Skip the entire CREATE TYPE statement (may be multi-line)
 				if !strings.HasSuffix(strings.TrimSpace(line), ";") {
@@ -868,7 +869,7 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 					continue
 				}
 				// ALTER TYPE RENAME TO is not ENUM-specific, but check if it's an ENUM
-				if strings.Contains(line, "RENAME TO") && isAlterTypeForEnum(line, enumTracker) {
+				if strings.Contains(line, "RENAME TO") && ddlrewrite.IsAlterTypeForEnum(line, enumTracker) {
 					// Skip renaming ENUM types as they won't exist
 					continue
 				}
@@ -904,7 +905,7 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			// Handle ALTER TABLE ... ALTER COLUMN ... TYPE
 			convertedLine := line
 			if s.convertEnumsToText && enumTracker != nil {
-				convertedLine = convertEnumTypeInAlterColumn(line, enumTracker)
+				convertedLine = ddlrewrite.ConvertEnumTypeInAlterColumn(line, enumTracker)
 			}
 			filteredDump.WriteString(convertedLine)
 			filteredDump.WriteString("\n")
@@ -1126,7 +1127,7 @@ func (s *SnapshotGenerator) getDumpFileName(suffix string) string {
 	return baseName + suffix + fileExtension
 }
 
-func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, dump []byte, enumTracker ...*enumTypeTracker) error {
+func (s *SnapshotGenerator) restoreIndicesWithTracking(ctx context.Context, dump []byte, enumTracker ...*ddlrewrite.EnumTypeTracker) error {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	trackingCtx, cancel := context.WithCancel(ctx)

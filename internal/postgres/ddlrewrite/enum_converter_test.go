@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package pgdumprestore
+package ddlrewrite
 
 import (
 	"strings"
@@ -37,19 +37,19 @@ func TestExtractEnumNameFromCreateType(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := extractEnumNameFromCreateType(tt.line)
+			result := ExtractEnumNameFromCreateType(tt.line)
 			if result != tt.expected {
-				t.Errorf("extractEnumNameFromCreateType() = %q, want %q", result, tt.expected)
+				t.Errorf("ExtractEnumNameFromCreateType() = %q, want %q", result, tt.expected)
 			}
 		})
 	}
 }
 
 func TestConvertEnumColumnsToText(t *testing.T) {
-	tracker := newEnumTypeTracker()
-	tracker.add("public.user_status")
-	tracker.add("public.country_code")
-	tracker.add("public.expense_category")
+	tracker := NewEnumTypeTracker()
+	tracker.Add("public.user_status")
+	tracker.Add("public.country_code")
+	tracker.Add("public.expense_category")
 
 	tests := []struct {
 		name     string
@@ -85,21 +85,21 @@ func TestConvertEnumColumnsToText(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertEnumTypeInLine(tt.input, tracker)
+			result := ConvertEnumTypeInLine(tt.input, tracker)
 			// Normalize whitespace for comparison
 			result = strings.TrimSpace(result)
 			expected := strings.TrimSpace(tt.expected)
 			if result != expected {
-				t.Errorf("convertEnumTypeInLine():\ngot:  %q\nwant: %q", result, expected)
+				t.Errorf("ConvertEnumTypeInLine():\ngot:  %q\nwant: %q", result, expected)
 			}
 		})
 	}
 }
 
 func TestConvertEnumColumnsToTextFullTable(t *testing.T) {
-	tracker := newEnumTypeTracker()
-	tracker.add("public.user_status")
-	tracker.add("public.country_code")
+	tracker := NewEnumTypeTracker()
+	tracker.Add("public.user_status")
+	tracker.Add("public.country_code")
 
 	input := `CREATE TABLE public.users (
     id integer NOT NULL,
@@ -113,10 +113,10 @@ func TestConvertEnumColumnsToTextFullTable(t *testing.T) {
     countries text[]
 );`
 
-	result := convertEnumColumnsToText(input, tracker)
+	result := ConvertEnumColumnsToText(input, tracker)
 
 	if strings.TrimSpace(result) != strings.TrimSpace(expected) {
-		t.Errorf("convertEnumColumnsToText():\ngot:\n%s\n\nwant:\n%s", result, expected)
+		t.Errorf("ConvertEnumColumnsToText():\ngot:\n%s\n\nwant:\n%s", result, expected)
 	}
 }
 
@@ -124,9 +124,9 @@ func TestConvertEnumColumnsToTextFullTable(t *testing.T) {
 // when a line contains multiple ENUM types (like function signatures),
 // ALL of them must be converted to text, not just the first one.
 func TestConvertMultipleEnumsInSingleLine(t *testing.T) {
-	tracker := newEnumTypeTracker()
-	tracker.add(`public."status_type"`)
-	tracker.add(`public."priority_level"`)
+	tracker := NewEnumTypeTracker()
+	tracker.Add(`public."status_type"`)
+	tracker.Add(`public."priority_level"`)
 
 	tests := []struct {
 		name     string
@@ -152,12 +152,12 @@ func TestConvertMultipleEnumsInSingleLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertEnumTypeInLine(tt.input, tracker)
+			result := ConvertEnumTypeInLine(tt.input, tracker)
 			result = strings.TrimSpace(result)
 			expected := strings.TrimSpace(tt.expected)
 
 			if result != expected {
-				t.Errorf("convertEnumTypeInLine() with multiple ENUMs:\ngot:  %q\nwant: %q", result, expected)
+				t.Errorf("ConvertEnumTypeInLine() with multiple ENUMs:\ngot:  %q\nwant: %q", result, expected)
 			}
 
 			// Extra verification: ensure NO ENUM types remain in the result
