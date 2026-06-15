@@ -73,6 +73,10 @@ func newPGSchemaObserver(ctx context.Context, pgURL, sourceURL string, convertEn
 			_ = pgConn.Close(context.Background())
 			return nil, err
 		}
+	} else if convertEnumsToText {
+		// without a source URL the enum tracker starts empty: DDL referencing an
+		// enum created before the stream started would not be converted to text.
+		logger.Warn(nil, "convert_enums_to_text is enabled but no source URL is available to bootstrap existing enum types; DDL referencing pre-existing enums may not be converted")
 	}
 
 	return o, nil

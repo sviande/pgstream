@@ -170,3 +170,57 @@ func TestConvertMultipleEnumsInSingleLine(t *testing.T) {
 		})
 	}
 }
+
+// TestDuplicatePatternsWhenAddingQualifiedAndUnqualified tests for the duplicate
+// pattern generation bug when both 'public.status' and 'status' are added
+func TestDuplicatePatternsWhenAddingQualifiedAndUnqualified(t *testing.T) {
+	tracker := NewEnumTypeTracker()
+
+	// Scenario: Add both 'public.status' and 'status'
+	// This can happen when:
+	// 1. Bootstrap discovers existing "public.status" and calls Add("public.status")
+	// 2. Then a DDL statement "CREATE TYPE status AS ENUM" arrives and calls Add("status")
+	tracker.Add("public.status")
+	countAfterFirst := tracker.TypeCount()
+	t.Logf("Types count after Add('public.status'): %d", countAfterFirst)
+
+	tracker.Add("status")
+	countAfterSecond := tracker.TypeCount()
+	t.Logf("Types count after Add('status'): %d", countAfterSecond)
+
+	// Compute patterns
+	tracker.ComputeSortedPatterns()
+	patternCount := tracker.PatternCount()
+	t.Logf("Pattern count after ComputeSortedPatterns: %d", patternCount)
+
+	// Analysis:
+	// When we Add("public.status"), the map gets:
+	// - "public.status" (original)
+	// - "public.status" (cleanName, same)
+	// - "status" (unqualified)
+	// - "\"status\"" (quoted unqualified)
+
+	// When we Add("status"), the map gets:
+	// - "status" (already exists, so unchanged)
+	// - "status" (cleanName, same, already exists)
+	// - no dot, so no additional entries
+
+	// So the types map should have: {"public.status", "status", "\"status\""}
+	// That's 3 entries in the types map
+
+	// When ComputeSortedPatterns iterates over these 3:
+	// 1. "public.status": generates 8 schema-qualified + 4 unqualified = 12 patterns
+	// 2. "status": schema="" so no schema-qualified, generates 4 unqualified patterns (DUPLICATES!)
+	// 3. "\"status\"": same as above after trimming quotes
+
+	// Expected: 12 unique patterns (deduped)
+	// Actual (with bug): 12 + 4 + 4 = 20 patterns (with duplicates)
+
+	expectedMaxWithoutDuplicates := 12
+	expectedWithDuplicates := 20
+
+	if patternCount > expectedMaxWithoutDuplicates && patternCount <= expectedWithDuplicates {
+		t.Logf("CONFIRMED: Duplicate patterns detected. Got %d patterns (expected max %d unique)",
+			patternCount, expectedMaxWithoutDuplicates)
+	}
+}

@@ -804,6 +804,7 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			eventTriggersDump.WriteString("\n")
 
 		case strings.HasPrefix(line, "CREATE VIEW"),
+			strings.HasPrefix(line, "CREATE OR REPLACE VIEW"),
 			strings.HasPrefix(line, "CREATE MATERIALIZED VIEW"):
 			// Filter out views that match excluded_views patterns (wildcards only),
 			// matching the fork behaviour so excluded views never reach the views dump.
@@ -917,20 +918,6 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 		case strings.HasPrefix(line, "ALTER TABLE") && !strings.HasSuffix(line, ";"):
 			// keep it in case the alter table is provided in two lines (pg_dump format)
 			alterTable = line
-		case strings.HasPrefix(line, "CREATE VIEW") || strings.HasPrefix(line, "CREATE OR REPLACE VIEW"):
-			// Filter out views that match excluded_views patterns (wildcards only)
-			if s.shouldExcludeView(line) {
-				// Skip this view and all following lines until we hit a semicolon
-				for scanner.Scan() {
-					viewLine := scanner.Text()
-					if strings.HasSuffix(strings.TrimSpace(viewLine), ";") {
-						break
-					}
-				}
-				continue
-			}
-			filteredDump.WriteString(line)
-			filteredDump.WriteString("\n")
 		case strings.HasPrefix(line, "CREATE SEQUENCE"):
 			qualifiedName, err := pglib.NewQualifiedName(strings.TrimPrefix(line, "CREATE SEQUENCE "))
 			if err == nil {
