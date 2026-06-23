@@ -207,8 +207,47 @@ func (r *TableRenamer) renameTablesInSQLForRule(sql string, rule compiledRule) s
 		return match
 	})
 
+	// Pattern 4: unqualified quoted table name preceded by a DDL keyword that
+	// always introduces a table reference (e.g. ALTER TABLE "User", CREATE INDEX
+	// ... ON "User", REFERENCES "Account"). Live DDL frequently omits the schema
+	// qualifier (current_query() captures it as typed), so patterns 1-3 miss it
+	// and the statement is replayed verbatim on a renamed target -> "relation
+	// \"User\" does not exist".
+	//
+	// Restricted to *quoted* identifiers right after a structural keyword so it
+	// never touches column names, values or keywords (IF, NOT, EXISTS...). The
+	// schema cannot be known for an unqualified name, so the rule is applied
+	// regardless of its schema filter (assumes the default/search-path schema).
+	result = unqualifiedTablePattern.ReplaceAllStringFunc(result, func(match string) string {
+		parts := unqualifiedTablePattern.FindStringSubmatch(match)
+		if len(parts) != 4 {
+			return match
+		}
+		keyword := parts[1]
+		table := parts[2]
+		trailingDot := parts[3]
+
+		// A trailing dot means this is the schema part of a qualified name
+		// (e.g. ON "schema"."table"); leave it to patterns 1-3.
+		if trailingDot == "." {
+			return match
+		}
+
+		if rule.matchRegex.MatchString(table) {
+			newTable := rule.matchRegex.ReplaceAllString(table, rule.replaceStr)
+			return fmt.Sprintf(`%s"%s"`, keyword, newTable)
+		}
+
+		return match
+	})
+
 	return result
 }
+
+// unqualifiedTablePattern matches a quoted identifier that directly follows a
+// DDL keyword introducing a table reference. The third group captures an
+// optional trailing dot so qualified names (schema part) can be skipped.
+var unqualifiedTablePattern = regexp.MustCompile(`(?i)(\b(?:TABLE|ONLY|ON|REFERENCES|INHERITS|TRUNCATE)\s+)"([^"]+)"(\.?)`)
 
 // isReservedWord checks if a word is a SQL reserved word that should not be treated as a table name.
 func isReservedWord(word string) bool {

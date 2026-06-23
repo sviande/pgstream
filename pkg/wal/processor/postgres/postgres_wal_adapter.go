@@ -53,8 +53,8 @@ type (
 	ddlEventAdapter func(*wal.Data) (*wal.DDLEvent, error)
 )
 
-func newAdapter(ctx context.Context, logger loglib.Logger, ignoreDDL bool, pgURL string, onConflictAction string, forCopy bool, sourceURL string, convertEnumsToText bool, tableRenamer *renamer.TableRenamer) (*adapter, error) {
-	schemaObserver, err := newPGSchemaObserver(ctx, pgURL, sourceURL, convertEnumsToText, tableRenamer, logger)
+func newAdapter(ctx context.Context, logger loglib.Logger, ignoreDDL bool, pgURL string, onConflictAction string, forCopy bool, sourceURL string, convertEnumsToText bool, excludeTriggers bool, tableRenamer *renamer.TableRenamer) (*adapter, error) {
+	schemaObserver, err := newPGSchemaObserver(ctx, pgURL, sourceURL, convertEnumsToText, excludeTriggers, tableRenamer, logger)
 	if err != nil {
 		return nil, err
 	}

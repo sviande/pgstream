@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	pglib "github.com/xataio/pgstream/internal/postgres"
@@ -35,6 +36,10 @@ type pgSchemaObserver struct {
 
 	// convertEnumsToText enables ENUM->TEXT rewriting of replicated DDL.
 	convertEnumsToText bool
+	// excludeTriggers, when true, drops replicated trigger DDL (CREATE/ALTER/DROP
+	// TRIGGER) so triggers are never applied on the target, consistent with the
+	// schema snapshot's exclude_triggers behaviour.
+	excludeTriggers bool
 	// tableRenamer, when set, rewrites table identifiers in replicated DDL.
 	tableRenamer *renamer.TableRenamer
 	// enumMu guards enumTracker, which is not safe for concurrent use.
@@ -49,7 +54,7 @@ type pgSchemaObserver struct {
 // including generated table columns and materialized views. It keeps a cache to
 // reduce the number of calls to postgres, and it updates the state whenever a
 // DDL event is received through the WAL.
-func newPGSchemaObserver(ctx context.Context, pgURL, sourceURL string, convertEnumsToText bool, tableRenamer *renamer.TableRenamer, logger loglib.Logger) (*pgSchemaObserver, error) {
+func newPGSchemaObserver(ctx context.Context, pgURL, sourceURL string, convertEnumsToText, excludeTriggers bool, tableRenamer *renamer.TableRenamer, logger loglib.Logger) (*pgSchemaObserver, error) {
 	pgConn, err := pglib.NewConnPool(ctx, pgURL)
 	if err != nil {
 		return nil, err
@@ -62,6 +67,7 @@ func newPGSchemaObserver(ctx context.Context, pgURL, sourceURL string, convertEn
 		columnTableSequences:       synclib.NewMap[string, map[string]string](),
 		logger:                     logger,
 		convertEnumsToText:         convertEnumsToText,
+		excludeTriggers:            excludeTriggers,
 		tableRenamer:               tableRenamer,
 		enumTracker:                ddlrewrite.NewEnumTypeTracker(),
 	}
@@ -132,6 +138,15 @@ func (o *pgSchemaObserver) isEnumType(colType string) bool {
 // + table renaming), returning skip=true when it must not be applied. It is
 // safe for concurrent use.
 func (o *pgSchemaObserver) RewriteDDL(ddl, commandTag string) (string, bool) {
+	// Triggers are dropped here (not just at snapshot time) so the target never
+	// gets a trigger that references the source-side schema/table names.
+	// Note: emit_ddl captures current_query(), so a trigger created in the same
+	// statement as other DDL (e.g. CREATE FUNCTION; CREATE TRIGGER) shares that
+	// text; this skips events whose command tag is the trigger op.
+	if o.excludeTriggers && isTriggerCommandTag(commandTag) {
+		return "", true
+	}
+
 	o.enumMu.Lock()
 	defer o.enumMu.Unlock()
 	var tr ddlrewrite.TableRenamer
@@ -139,6 +154,13 @@ func (o *pgSchemaObserver) RewriteDDL(ddl, commandTag string) (string, bool) {
 		tr = o.tableRenamer
 	}
 	return ddlrewrite.RewriteDDL(ddl, commandTag, o.convertEnumsToText, o.enumTracker, tr)
+}
+
+// isTriggerCommandTag reports whether the DDL command tag is a trigger
+// operation: CREATE TRIGGER, CREATE CONSTRAINT TRIGGER (tag "CREATE TRIGGER"),
+// ALTER TRIGGER or DROP TRIGGER.
+func isTriggerCommandTag(commandTag string) bool {
+	return strings.Contains(strings.ToUpper(commandTag), "TRIGGER")
 }
 
 // getGeneratedColumnNames will return a list of generated column names for the

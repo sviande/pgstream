@@ -18,6 +18,11 @@ type Config struct {
 	BulkIngestEnabled bool
 	RetryPolicy       backoff.Config
 	IgnoreDDL         bool
+	// ExcludeTriggers, when true, skips replicated trigger DDL (CREATE/ALTER/DROP
+	// TRIGGER) so the target never gets triggers, matching the schema snapshot's
+	// exclude_triggers behaviour. Without it, trigger DDL is only filtered from
+	// the initial snapshot but still replayed live during CDC.
+	ExcludeTriggers bool
 	// SourceURL is the source database URL. It is only used to bootstrap the
 	// set of existing ENUM types when ConvertEnumsToText is enabled, so that DDL
 	// referencing a pre-existing enum is converted even though its CREATE TYPE
