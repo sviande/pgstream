@@ -75,6 +75,13 @@ func QuoteIdentifier(s string) string {
 	return pq.QuoteIdentifier(s)
 }
 
+// QuoteLiteral quotes a string so it can be safely used as an SQL string
+// literal, escaping any embedded quotes and backslashes. For example, the
+// value 1GB becomes the quoted literal '1GB'.
+func QuoteLiteral(s string) string {
+	return pq.QuoteLiteral(s)
+}
+
 // UnquoteIdentifier reverses the quoting applied by QuoteIdentifier. If the
 // string is not a quoted identifier, it is returned as-is. If it is a quoted
 // identifier, the leading and trailing quotes are removed, and any embedded

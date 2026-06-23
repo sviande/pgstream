@@ -55,6 +55,14 @@ type SnapshotGenerator struct {
 	// generator runs. Other indexes and constraints, such as foreign keys, are
 	// still restored after data is inserted.
 	restoreConflictTargetsBeforeData bool
+	// indexBuildSettings holds the SET statements prepended to the
+	// indices/constraints dump to speed up index creation (e.g.
+	// maintenance_work_mem). nil when no tuning is configured.
+	indexBuildSettings []byte
+	// restoreToWAL is true when the restore emits WAL events instead of creating
+	// physical objects (see WithRestoreToWAL). In that mode the index build
+	// session settings are not applicable and are not injected.
+	restoreToWAL bool
 }
 
 type snapshotProgressTracker interface {
@@ -97,6 +105,16 @@ type Config struct {
 	// ExcludeDropSchema excludes DROP SCHEMA and CREATE SCHEMA statements from cleanup
 	// when clean_target_db is enabled. Useful when schemas should already exist in target.
 	ExcludeDropSchema bool
+	// IndexBuildMaintenanceWorkMem, when set, is applied as
+	// `SET maintenance_work_mem` on the session that restores indices and
+	// constraints (e.g. "1GB"), to speed up index creation. Empty leaves the
+	// server default untouched.
+	IndexBuildMaintenanceWorkMem string
+	// IndexBuildMaxParallelMaintenanceWorkers, when greater than 0, is applied as
+	// `SET max_parallel_maintenance_workers` on the session that restores indices
+	// and constraints, to allow parallel index builds. 0 leaves the server
+	// default untouched.
+	IndexBuildMaxParallelMaintenanceWorkers int
 }
 
 type Option func(s *SnapshotGenerator)
@@ -144,6 +162,7 @@ func NewSnapshotGenerator(ctx context.Context, c *Config, opts ...Option) (*Snap
 		roleSQLParser:           &roleSQLParser{},
 		sourceQuerier:           sourceConnPool,
 		optionGenerator:         newOptionGenerator(sourceConnPool, c),
+		indexBuildSettings:      buildIndexBuildSettings(c),
 	}
 
 	for _, opt := range opts {
@@ -151,6 +170,25 @@ func NewSnapshotGenerator(ctx context.Context, c *Config, opts ...Option) (*Snap
 	}
 
 	return sg, nil
+}
+
+// buildIndexBuildSettings builds the SQL SET statements that tune the session
+// restoring indices and constraints, based on the configured values. It returns
+// nil when no tuning is configured.
+func buildIndexBuildSettings(c *Config) []byte {
+	var b strings.Builder
+	if c.IndexBuildMaintenanceWorkMem != "" {
+		fmt.Fprintf(&b, "SET maintenance_work_mem TO %s;\n", pglib.QuoteLiteral(c.IndexBuildMaintenanceWorkMem))
+	}
+	if c.IndexBuildMaxParallelMaintenanceWorkers > 0 {
+		fmt.Fprintf(&b, "SET max_parallel_maintenance_workers TO %d;\n", c.IndexBuildMaxParallelMaintenanceWorkers)
+	}
+	if b.Len() == 0 {
+		return nil
+	}
+	// trailing blank line to keep the dump block separation (\n\n) intact
+	b.WriteString("\n")
+	return []byte(b.String())
 }
 
 func WithLogger(logger loglib.Logger) Option {
@@ -196,6 +234,7 @@ func WithProgressTracking(ctx context.Context) Option {
 func WithRestoreToWAL(processor processor.Processor) Option {
 	return func(sg *SnapshotGenerator) {
 		sg.pgRestoreFn = newPGSnapshotWALRestore(processor, sg.sourceQuerier).restoreToWAL
+		sg.restoreToWAL = true
 	}
 }
 
@@ -365,10 +404,42 @@ func isConflictTargetConstraint(block string) bool {
 
 func (s *SnapshotGenerator) restoreIndicesAndConstraints(ctx context.Context, dump []byte, ss *snapshot.Snapshot, enumTracker ...*ddlrewrite.EnumTypeTracker) error {
 	s.logger.Info("restoring schema indices and constraints", loglib.Fields{"schemaTables": ss.SchemaTables})
+	dump = s.prependIndexBuildSettings(dump)
 	if s.snapshotTracker != nil {
 		return s.restoreIndicesWithTracking(ctx, dump, enumTracker...)
 	}
 	return s.restoreDump(ctx, dump, enumTracker...)
+}
+
+// prependIndexBuildSettings injects the configured session SET statements into
+// the indices/constraints dump so they apply to the same psql session that
+// creates the indices. The statements must be placed after any \connect
+// meta-command, since \connect opens a new session that would discard SET
+// statements issued before it. The settings are not injected when restoring to
+// WAL, since no physical index creation happens in that mode.
+func (s *SnapshotGenerator) prependIndexBuildSettings(dump []byte) []byte {
+	if len(s.indexBuildSettings) == 0 || len(dump) == 0 || s.restoreToWAL {
+		return dump
+	}
+
+	insertAt := 0
+	// place the settings right after the last \connect line, if any
+	if idx := bytes.LastIndex(dump, []byte(`\connect`)); idx != -1 {
+		if nl := bytes.IndexByte(dump[idx:], '\n'); nl != -1 {
+			insertAt = idx + nl + 1
+		} else {
+			// \connect is the last line and has no trailing newline
+			out := make([]byte, 0, len(dump)+len(s.indexBuildSettings)+1)
+			out = append(out, dump...)
+			out = append(out, '\n')
+			return append(out, s.indexBuildSettings...)
+		}
+	}
+
+	out := make([]byte, 0, len(dump)+len(s.indexBuildSettings))
+	out = append(out, dump[:insertAt]...)
+	out = append(out, s.indexBuildSettings...)
+	return append(out, dump[insertAt:]...)
 }
 
 func (s *SnapshotGenerator) Close() error {

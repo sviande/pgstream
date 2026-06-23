@@ -43,6 +43,8 @@ source:
           roles_snapshot_mode: # enabled by default. Can be set to disabled to disable roles snapshotting, or can be set to no_passwords to exclude role passwords
           exclude_security_labels: ["anon"] # list of providers whose security labels will be excluded from the snapshot. Wildcard supported.
           dump_file: pg_dump.sql # name of the file where the contents of the schema pg_dump command and output will be written for debugging purposes.
+          index_build_maintenance_work_mem: 1GB # value applied as maintenance_work_mem on the session that restores indices/constraints, to speed up index creation. Unset by default (server default).
+          index_build_max_parallel_maintenance_workers: 4 # value applied as max_parallel_maintenance_workers on the session that restores indices/constraints, to allow parallel index builds. Unset by default (server default). Bounded server-side by max_worker_processes.
     replication: # when mode is replication or snapshot_and_replication
       replication_slot: "pgstream_mydatabase_slot"
       plugin:

@@ -1592,3 +1592,117 @@ func TestSnapshotGenerator_filterTriggers(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildIndexBuildSettings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cfg  *Config
+		want string
+	}{
+		{
+			name: "no tuning configured",
+			cfg:  &Config{},
+			want: "",
+		},
+		{
+			name: "maintenance_work_mem only",
+			cfg:  &Config{IndexBuildMaintenanceWorkMem: "1GB"},
+			want: "SET maintenance_work_mem TO '1GB';\n\n",
+		},
+		{
+			name: "max_parallel_maintenance_workers only",
+			cfg:  &Config{IndexBuildMaxParallelMaintenanceWorkers: 4},
+			want: "SET max_parallel_maintenance_workers TO 4;\n\n",
+		},
+		{
+			name: "both settings",
+			cfg: &Config{
+				IndexBuildMaintenanceWorkMem:            "2GB",
+				IndexBuildMaxParallelMaintenanceWorkers: 8,
+			},
+			want: "SET maintenance_work_mem TO '2GB';\nSET max_parallel_maintenance_workers TO 8;\n\n",
+		},
+		{
+			name: "negative worker count is ignored",
+			cfg:  &Config{IndexBuildMaxParallelMaintenanceWorkers: -1},
+			want: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := buildIndexBuildSettings(tc.cfg)
+			require.Equal(t, tc.want, string(got))
+		})
+	}
+}
+
+func TestSnapshotGenerator_prependIndexBuildSettings(t *testing.T) {
+	t.Parallel()
+
+	settings := []byte("SET maintenance_work_mem TO '1GB';\n\n")
+
+	tests := []struct {
+		name         string
+		settings     []byte
+		restoreToWAL bool
+		dump         []byte
+		want         []byte
+	}{
+		{
+			name:     "no settings configured",
+			settings: nil,
+			dump:     []byte("CREATE INDEX a;\n\n"),
+			want:     []byte("CREATE INDEX a;\n\n"),
+		},
+		{
+			name:     "empty dump",
+			settings: settings,
+			dump:     nil,
+			want:     nil,
+		},
+		{
+			name:         "restore to WAL leaves dump untouched",
+			settings:     settings,
+			restoreToWAL: true,
+			dump:         []byte("CREATE INDEX a;\n\n"),
+			want:         []byte("CREATE INDEX a;\n\n"),
+		},
+		{
+			name:     "no connect line prepends at top",
+			settings: settings,
+			dump:     []byte("CREATE INDEX a;\n\n"),
+			want:     []byte("SET maintenance_work_mem TO '1GB';\n\nCREATE INDEX a;\n\n"),
+		},
+		{
+			name:     "settings inserted after connect line",
+			settings: settings,
+			dump:     []byte("\\connect mydb\n\nCREATE INDEX a;\n\n"),
+			want:     []byte("\\connect mydb\nSET maintenance_work_mem TO '1GB';\n\n\nCREATE INDEX a;\n\n"),
+		},
+		{
+			name:     "connect line without trailing newline",
+			settings: settings,
+			dump:     []byte("\\connect mydb"),
+			want:     []byte("\\connect mydb\nSET maintenance_work_mem TO '1GB';\n\n"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := &SnapshotGenerator{
+				indexBuildSettings: tc.settings,
+				restoreToWAL:       tc.restoreToWAL,
+			}
+
+			got := s.prependIndexBuildSettings(tc.dump)
+			require.Equal(t, string(tc.want), string(got))
+		})
+	}
+}

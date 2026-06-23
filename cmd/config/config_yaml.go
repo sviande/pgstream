@@ -133,6 +133,13 @@ type PgDumpPgRestoreConfig struct {
 	DumpFile               string   `mapstructure:"dump_file" yaml:"dump_file"`
 	ExcludedSecurityLabels []string `mapstructure:"excluded_security_labels" yaml:"excluded_security_labels"`
 	ExcludeDropSchema      bool     `mapstructure:"exclude_drop_schema" yaml:"exclude_drop_schema"`
+	// IndexBuildMaintenanceWorkMem sets maintenance_work_mem (e.g. "1GB") on the
+	// session that restores indices and constraints, to speed up index creation.
+	IndexBuildMaintenanceWorkMem string `mapstructure:"index_build_maintenance_work_mem" yaml:"index_build_maintenance_work_mem"`
+	// IndexBuildMaxParallelMaintenanceWorkers sets max_parallel_maintenance_workers
+	// on the session that restores indices and constraints, to allow parallel
+	// index builds.
+	IndexBuildMaxParallelMaintenanceWorkers int `mapstructure:"index_build_max_parallel_maintenance_workers" yaml:"index_build_max_parallel_maintenance_workers"`
 }
 
 type ReplicationConfig struct {
@@ -644,6 +651,8 @@ func (c *YAMLConfig) parseSchemaSnapshotConfig() (*snapshotbuilder.SchemaSnapsho
 		streamSchemaCfg.DumpRestore.DumpDebugFile = schemaSnapshotCfg.PgDumpPgRestore.DumpFile
 		streamSchemaCfg.DumpRestore.ExcludedSecurityLabels = schemaSnapshotCfg.PgDumpPgRestore.ExcludedSecurityLabels
 		streamSchemaCfg.DumpRestore.ExcludeDropSchema = schemaSnapshotCfg.PgDumpPgRestore.ExcludeDropSchema
+		streamSchemaCfg.DumpRestore.IndexBuildMaintenanceWorkMem = schemaSnapshotCfg.PgDumpPgRestore.IndexBuildMaintenanceWorkMem
+		streamSchemaCfg.DumpRestore.IndexBuildMaxParallelMaintenanceWorkers = schemaSnapshotCfg.PgDumpPgRestore.IndexBuildMaxParallelMaintenanceWorkers
 
 		var err error
 		streamSchemaCfg.DumpRestore.RolesSnapshotMode, err = getRolesSnapshotMode(schemaSnapshotCfg.PgDumpPgRestore.RolesSnapshotMode)
@@ -723,6 +732,7 @@ func (c *YAMLConfig) parsePostgresProcessorConfig() (*stream.PostgresProcessorCo
 			OnConflictAction:   c.Target.Postgres.OnConflictAction,
 			RetryPolicy:        c.Target.Postgres.RetryPolicy.parseBackoffConfig(),
 			IgnoreDDL:          c.Target.Postgres.IgnoreDDL,
+			ExcludeTriggers:    c.Target.Postgres.ExcludeTriggers,
 			ConvertEnumsToText: c.Target.Postgres.ConvertEnumsToText,
 		},
 	}
