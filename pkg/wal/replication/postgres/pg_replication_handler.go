@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 
 	pglib "github.com/xataio/pgstream/internal/postgres"
 	loglib "github.com/xataio/pgstream/pkg/log"
@@ -29,6 +30,19 @@ type Handler struct {
 	lsnParser replication.LSNParser
 
 	pluginArguments []string
+
+	// connMu serializes every access to pgReplicationConn. The replication
+	// connection (pgconn) is not safe for concurrent use: ReceiveMessage runs in
+	// the listener goroutine while SyncLSN (SendStandbyStatusUpdate) runs in the
+	// checkpointer goroutine, and ResetConnection swaps the connection. Without
+	// this lock those accesses race and corrupt the CopyBoth protocol stream
+	// (observed in production as "unexpected message: ReadyForQuery" desyncs).
+	connMu sync.Mutex
+	// connBroken is set by a failing ReceiveMessage/SyncLSN and cleared once
+	// ResetConnection has rebuilt the connection. It makes ResetConnection
+	// single-flight so concurrent failures trigger a single reconnect instead of
+	// each goroutine tearing down a freshly rebuilt connection.
+	connBroken bool
 }
 
 type Config struct {
@@ -201,13 +215,21 @@ func (h *Handler) StartReplicationFromLSN(ctx context.Context, lsn replication.L
 
 	h.logger.Info("logical replication started", h.logFields)
 
-	return h.SyncLSN(ctx, lsn)
+	// syncLSNLocked (not SyncLSN) avoids re-acquiring connMu: this runs either at
+	// startup (single-threaded) or from ResetConnection, which already holds it.
+	return h.syncLSNLocked(ctx, lsn)
 }
 
 // ReceiveMessage will listen for messages from the WAL. It returns an error if
 // an unexpected message is received.
 func (h *Handler) ReceiveMessage(ctx context.Context) (*replication.Message, error) {
+	h.connMu.Lock()
 	pgMsg, err := h.pgReplicationConn.ReceiveMessage(ctx)
+	if err != nil && !h.isExcludedTableError(err) {
+		h.connBroken = true
+	}
+	h.connMu.Unlock()
+
 	if err != nil {
 		switch {
 		case h.isExcludedTableError(err):
@@ -228,8 +250,18 @@ func (h *Handler) ReceiveMessage(ctx context.Context) (*replication.Message, err
 
 // SyncLSN notifies Postgres how far we have processed in the WAL.
 func (h *Handler) SyncLSN(ctx context.Context, lsn replication.LSN) error {
-	err := h.pgReplicationConn.SendStandbyStatusUpdate(ctx, uint64(lsn))
-	if err != nil {
+	h.connMu.Lock()
+	defer h.connMu.Unlock()
+	return h.syncLSNLocked(ctx, lsn)
+}
+
+// syncLSNLocked sends a standby status update without acquiring connMu. The
+// caller must hold connMu, or run before the listener/checkpointer goroutines
+// start (the initial StartReplication). It is split out so StartReplicationFromLSN
+// can reuse it while ResetConnection already holds the lock, avoiding a deadlock.
+func (h *Handler) syncLSNLocked(ctx context.Context, lsn replication.LSN) error {
+	if err := h.pgReplicationConn.SendStandbyStatusUpdate(ctx, uint64(lsn)); err != nil {
+		h.connBroken = true
 		return fmt.Errorf("syncLSN: send status update: %w", err)
 	}
 	h.logger.Trace("stored new LSN position", loglib.Fields{
@@ -277,6 +309,15 @@ func (h *Handler) GetReplicationSlotName() string {
 }
 
 func (h *Handler) ResetConnection(ctx context.Context) error {
+	h.connMu.Lock()
+	defer h.connMu.Unlock()
+
+	// another goroutine already rebuilt the connection after the same failure;
+	// nothing to do (single-flight).
+	if !h.connBroken {
+		return nil
+	}
+
 	conn, err := h.pgReplicationConnBuilder()
 	if err != nil {
 		return err
@@ -286,7 +327,14 @@ func (h *Handler) ResetConnection(ctx context.Context) error {
 	}
 	h.pgReplicationConn = conn
 
-	return h.StartReplication(ctx)
+	// StartReplication does not take connMu (we already hold it); it is otherwise
+	// only called once at startup, before the listener/checkpointer goroutines run.
+	if err := h.StartReplication(ctx); err != nil {
+		// keep connBroken set so the next retry attempts the reset again
+		return err
+	}
+	h.connBroken = false
+	return nil
 }
 
 // GetLSNParser returns a postgres implementation of the LSN parser.
@@ -296,6 +344,8 @@ func (h *Handler) GetLSNParser() replication.LSNParser {
 
 // Close closes the database connections.
 func (h *Handler) Close() error {
+	h.connMu.Lock()
+	defer h.connMu.Unlock()
 	return h.pgReplicationConn.Close(context.Background())
 }
 
