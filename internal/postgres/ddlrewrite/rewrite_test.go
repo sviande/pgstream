@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
 // fakeRenamer renames public.<t> -> public.piana_<t> in raw SQL, mimicking the
@@ -169,6 +171,42 @@ func TestUpdateTrackerFromEnumDDL(t *testing.T) {
 	UpdateTrackerFromEnumDDL(tr, "DROP TYPE", "DROP TYPE public.color;")
 	if tr.IsEnum("public.color") {
 		t.Errorf("dropped enum should be untracked")
+	}
+}
+
+// TestRewriteDDL_MultiStatementBackfillRename exercises the full RewriteDDL ->
+// renamer.RenameInSQL path with the production rule on an "ALTER + backfill"
+// block captured whole by current_query(). The UPDATE/FROM tables must be
+// renamed (else the backfill fails with "relation does not exist" and rolls back
+// the ADD COLUMN), while columns, aliases and alias-qualified refs stay intact.
+func TestRewriteDDL_MultiStatementBackfillRename(t *testing.T) {
+	r, err := renamer.NewTableRenamer(&renamer.Config{Rules: []renamer.Rule{
+		{Schema: "public", Match: "^(.*)$", Replace: "piana_$1"},
+	}})
+	if err != nil {
+		t.Fatalf("build renamer: %v", err)
+	}
+
+	ddl := `ALTER TABLE "EvPassOrder" ADD COLUMN "companyName" TEXT;
+UPDATE "EvPassOrder" AS "order"
+SET "companyName" = "company"."name"
+FROM "Company" AS "company"
+WHERE "order"."companyId" = "company"."id";
+ALTER TABLE "EvPassOrder" ALTER COLUMN "companyName" SET NOT NULL;`
+
+	want := `ALTER TABLE "piana_EvPassOrder" ADD COLUMN "companyName" TEXT;
+UPDATE "piana_EvPassOrder" AS "order"
+SET "companyName" = "company"."name"
+FROM "piana_Company" AS "company"
+WHERE "order"."companyId" = "company"."id";
+ALTER TABLE "piana_EvPassOrder" ALTER COLUMN "companyName" SET NOT NULL;`
+
+	got, skip := RewriteDDL(ddl, "ALTER TABLE", false, nil, r)
+	if skip {
+		t.Fatalf("unexpected skip")
+	}
+	if got != want {
+		t.Errorf("RewriteDDL mismatch:\n got:  %s\n want: %s", got, want)
 	}
 }
 
