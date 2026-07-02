@@ -56,6 +56,153 @@ func TestRewriteDDL_SkipEnumTypeDDL(t *testing.T) {
 	}
 }
 
+func TestRewriteDDL_MultiStatementDropTypeStripped(t *testing.T) {
+	tr := trackerWith("public.MonEnum1", "public.MonEnum2")
+	ddl := "-- Remove the scraper cache.\n-- Second comment line.\n\nDROP TABLE \"VehicleScraperCache\";\n\nDROP TYPE \"MonEnum1\";\n\nDROP TYPE \"MonEnum2\";\n"
+
+	for _, tag := range []string{"DROP TABLE", "DROP TYPE"} {
+		t.Run(tag, func(t *testing.T) {
+			got, skip := RewriteDDL(ddl, tag, true, tr, nil)
+			if skip {
+				t.Fatalf("unexpected skip")
+			}
+			if strings.Contains(got, "DROP TYPE") {
+				t.Errorf("DROP TYPE statements not stripped:\n%s", got)
+			}
+			if strings.Contains(got, "text") {
+				t.Errorf("enum drop must not be rewritten to DROP TYPE text:\n%s", got)
+			}
+			if !strings.Contains(got, `DROP TABLE "VehicleScraperCache"`) {
+				t.Errorf("DROP TABLE must be preserved:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestRewriteDDL_NonEnumDropTypeNotStripped(t *testing.T) {
+	tr := trackerWith("public.MonEnum1")
+	ddl := "DROP TABLE public.users;\nDROP TYPE public.my_composite;"
+	got, skip := RewriteDDL(ddl, "DROP TABLE", true, tr, nil)
+	if skip {
+		t.Fatalf("unexpected skip")
+	}
+	if !strings.Contains(got, "DROP TYPE public.my_composite") {
+		t.Errorf("composite DROP TYPE must be preserved:\n%s", got)
+	}
+}
+
+func TestRewriteDDL_MultiStatementEnumTypeStripped(t *testing.T) {
+	tr := trackerWith("public.StatusEnum", "public.ProviderEnum")
+
+	tests := []struct {
+		name         string
+		ddl          string
+		tag          string
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:         "single-line CREATE TYPE AS ENUM + table (Prisma-style comments)",
+			ddl:          "-- CreateEnum\nCREATE TYPE \"StatusEnum\" AS ENUM ('InProgress', 'Completed');\n\n-- CreateTable\nCREATE TABLE \"Order\" (\n    \"id\" TEXT NOT NULL,\n    \"status\" \"StatusEnum\" NOT NULL DEFAULT 'InProgress'\n);",
+			tag:          "CREATE TABLE",
+			wantContains: []string{`CREATE TABLE "Order"`, `"status" text NOT NULL DEFAULT 'InProgress'`},
+			wantAbsent:   []string{"CREATE TYPE", "AS ENUM", "StatusEnum"},
+		},
+		{
+			name:         "multi-line CREATE TYPE AS ENUM is fully removed",
+			ddl:          "CREATE TYPE \"StatusEnum\" AS ENUM (\n    'InProgress',\n    'Completed'\n);\nCREATE TABLE \"Order\" (\"id\" TEXT, \"status\" \"StatusEnum\");",
+			tag:          "CREATE TABLE",
+			wantContains: []string{`CREATE TABLE "Order"`, `"status" text`},
+			wantAbsent:   []string{"CREATE TYPE", "AS ENUM", "InProgress", "StatusEnum"},
+		},
+		{
+			name:         "ALTER TYPE ADD VALUE is removed",
+			ddl:          "-- AlterEnum\nALTER TYPE \"StatusEnum\" ADD VALUE 'Mobility';\nCREATE TABLE t (id int);",
+			tag:          "CREATE TABLE",
+			wantContains: []string{"CREATE TABLE t (id int);"},
+			wantAbsent:   []string{"ALTER TYPE", "ADD VALUE"},
+		},
+		{
+			name:         "ALTER TYPE RENAME TO a tracked enum is removed",
+			ddl:          "ALTER TYPE \"StatusEnum\" RENAME TO \"StatusEnum2\";\nCREATE TABLE t (id int);",
+			tag:          "CREATE TABLE",
+			wantContains: []string{"CREATE TABLE t (id int);"},
+			wantAbsent:   []string{"ALTER TYPE", "RENAME TO"},
+		},
+		{
+			name:         "reported CREATE TYPE text failure block (enums + alter + tables)",
+			ddl:          "-- CreateEnum\nCREATE TYPE \"ProviderEnum\" AS ENUM ('Dkv');\n\n-- CreateEnum\nCREATE TYPE \"StatusEnum\" AS ENUM ('Ordered', 'Active');\n\n-- AlterEnum\nALTER TYPE \"StatusEnum\" ADD VALUE 'Mobility';\n\n-- CreateTable\nCREATE TABLE \"piana_MobilityCard\" (\n    \"id\" TEXT NOT NULL,\n    \"provider\" \"ProviderEnum\" NOT NULL DEFAULT 'Dkv',\n    \"status\" \"StatusEnum\" NOT NULL DEFAULT 'Ordered'\n);",
+			tag:          "CREATE TABLE",
+			wantContains: []string{`CREATE TABLE "piana_MobilityCard"`, `"provider" text NOT NULL DEFAULT 'Dkv'`, `"status" text NOT NULL DEFAULT 'Ordered'`},
+			wantAbsent:   []string{"CREATE TYPE", "ALTER TYPE", "AS ENUM", "ADD VALUE", "ProviderEnum", "StatusEnum"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, skip := RewriteDDL(tt.ddl, tt.tag, true, tr, nil)
+			if skip {
+				t.Fatalf("unexpected skip")
+			}
+			for _, w := range tt.wantContains {
+				if !strings.Contains(got, w) {
+					t.Errorf("missing %q in:\n%s", w, got)
+				}
+			}
+			for _, w := range tt.wantAbsent {
+				if strings.Contains(got, w) {
+					t.Errorf("unexpected %q in:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
+func TestRewriteDDL_LeadingCommentSkipsEnumTypeDDL(t *testing.T) {
+	tr := trackerWith("public.StatusEnum")
+	_, skip := RewriteDDL("-- CreateEnum\nCREATE TYPE \"StatusEnum\" AS ENUM ('a');", "CREATE TYPE", true, tr, nil)
+	if !skip {
+		t.Errorf("CREATE TYPE AS ENUM behind a leading comment must be skipped")
+	}
+}
+
+func TestStripEnumTypeStatements(t *testing.T) {
+	tr := trackerWith("public.color", "public.mood")
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "multi-line CREATE TYPE AS ENUM removed",
+			in:   "CREATE TYPE \"color\" AS ENUM (\n    'red',\n    'green'\n);\nCREATE TABLE t (id int);",
+			want: "CREATE TABLE t (id int);",
+		},
+		{
+			name: "composite CREATE TYPE preserved",
+			in:   "CREATE TYPE \"pair\" AS (a int, b int);\nCREATE TABLE t (id int);",
+			want: "CREATE TYPE \"pair\" AS (a int, b int);\nCREATE TABLE t (id int);",
+		},
+		{
+			name: "DROP TYPE of composite (non-tracked) preserved, tracked enum removed",
+			in:   "DROP TYPE \"pair\";\nDROP TYPE \"color\";",
+			want: "DROP TYPE \"pair\";",
+		},
+		{
+			name: "ALTER TYPE ADD VALUE removed, unrelated ALTER TABLE kept",
+			in:   "ALTER TYPE \"mood\" ADD VALUE 'ok';\nALTER TABLE t ADD COLUMN x int;",
+			want: "ALTER TABLE t ADD COLUMN x int;",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stripEnumTypeStatements(tt.in, tr); got != tt.want {
+				t.Errorf("stripEnumTypeStatements()\n got:  %q\n want: %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRewriteDDL_NonEnumTypeNotSkipped(t *testing.T) {
 	tr := trackerWith("public.user_status")
 	// composite type, not an enum -> must NOT be skipped

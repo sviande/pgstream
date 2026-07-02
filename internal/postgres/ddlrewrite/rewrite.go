@@ -58,18 +58,27 @@ func RewriteDDL(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTrac
 	}
 
 	sql = ddl
-	if convertEnums && tracker != nil && tracker.TypeCount() > 0 {
-		tracker.ComputeSortedPatterns()
-		switch {
-		case strings.HasPrefix(tag, "ALTER TABLE") && strings.Contains(sql, "ALTER COLUMN") && strings.Contains(sql, "TYPE"):
-			sql = ConvertEnumTypeInAlterColumn(sql, tracker)
-		default:
-			// Covers CREATE TABLE, ALTER TABLE ADD COLUMN, casts/defaults, etc.
-			// We use the line-level converter on the whole statement rather than
-			// ConvertEnumColumnsToText: CDC DDL is a single statement (often a
-			// single line), and ConvertEnumColumnsToText skips lines starting with
-			// "CREATE TABLE", which would miss a single-line table definition.
-			sql = ConvertEnumTypeInLine(sql, tracker)
+	if convertEnums {
+		// Strip enum type DDL bundled into a multi-statement query first (this does
+		// not require tracked types: CREATE TYPE ... AS ENUM is detected
+		// syntactically). Otherwise the enum name would be converted to TEXT,
+		// producing invalid SQL such as "CREATE TYPE text AS ENUM ..." or
+		// "DROP TYPE text".
+		sql = stripEnumTypeStatements(sql, tracker)
+
+		if tracker != nil && tracker.TypeCount() > 0 {
+			tracker.ComputeSortedPatterns()
+			switch {
+			case strings.HasPrefix(tag, "ALTER TABLE") && strings.Contains(sql, "ALTER COLUMN") && strings.Contains(sql, "TYPE"):
+				sql = ConvertEnumTypeInAlterColumn(sql, tracker)
+			default:
+				// Covers CREATE TABLE, ALTER TABLE ADD COLUMN, casts/defaults, etc.
+				// We use the line-level converter on the whole statement rather than
+				// ConvertEnumColumnsToText: CDC DDL is a single statement (often a
+				// single line), and ConvertEnumColumnsToText skips lines starting with
+				// "CREATE TABLE", which would miss a single-line table definition.
+				sql = ConvertEnumTypeInLine(sql, tracker)
+			}
 		}
 	}
 
@@ -132,11 +141,70 @@ func dropTargetsTrackedEnum(line string, tracker *EnumTypeTracker) bool {
 	return false
 }
 
+// stripEnumTypeStatements removes enum type DDL from a possibly multi-statement
+// DDL block: CREATE TYPE ... AS ENUM, ALTER TYPE ... ADD/RENAME VALUE, ALTER TYPE
+// targeting a tracked enum, and DROP TYPE of a tracked enum. When converting
+// enums to TEXT the target has no enum types, so these statements must be dropped
+// rather than converted — a blind enum->text rewrite would otherwise produce
+// invalid SQL such as "CREATE TYPE text AS ENUM ..." or "DROP TYPE text".
+// current_query() can bundle enum type DDL with unrelated statements (a migration
+// block), so the whole event can't be skipped upstream. Statements are matched
+// line by line; a multi-line CREATE TYPE is dropped up to its terminating ";".
+func stripEnumTypeStatements(sql string, tracker *EnumTypeTracker) string {
+	up := strings.ToUpper(sql)
+	if !strings.Contains(up, "CREATE TYPE") && !strings.Contains(up, "ALTER TYPE") && !strings.Contains(up, "DROP TYPE") {
+		return sql
+	}
+
+	lines := strings.Split(sql, "\n")
+	kept := make([]string, 0, len(lines))
+	skipping := false
+	for _, line := range lines {
+		if skipping {
+			if endsStatement(line) {
+				skipping = false
+			}
+			continue
+		}
+		if isEnumTypeStatementStart(line, tracker) {
+			skipping = !endsStatement(line)
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+func endsStatement(line string) bool {
+	return strings.HasSuffix(strings.TrimSpace(line), ";")
+}
+
+// isEnumTypeStatementStart reports whether line begins an enum type statement
+// that must be dropped when converting enums to text.
+func isEnumTypeStatementStart(line string, tracker *EnumTypeTracker) bool {
+	trimmed := strings.TrimSpace(line)
+	up := strings.ToUpper(trimmed)
+	switch {
+	case strings.HasPrefix(up, "CREATE TYPE"):
+		return strings.Contains(up, "AS ENUM")
+	case strings.HasPrefix(up, "ALTER TYPE"):
+		return strings.Contains(up, "ADD VALUE") || strings.Contains(up, "RENAME VALUE") || IsAlterTypeForEnum(trimmed, tracker)
+	case strings.HasPrefix(up, "DROP TYPE"):
+		return dropTargetsTrackedEnum(trimmed, tracker)
+	}
+	return false
+}
+
+// firstNonEmptyLine returns the first line that is neither blank nor a SQL line
+// comment, so a leading "-- CreateEnum" comment does not hide the CREATE/ALTER/
+// DROP TYPE statement it precedes.
 func firstNonEmptyLine(s string) string {
 	for _, l := range strings.Split(s, "\n") {
-		if strings.TrimSpace(l) != "" {
-			return l
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "--") {
+			continue
 		}
+		return l
 	}
 	return s
 }
