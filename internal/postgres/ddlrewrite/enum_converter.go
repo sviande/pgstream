@@ -28,7 +28,8 @@ type EnumTypeTracker struct {
 type patternInfo struct {
 	pattern           string
 	length            int
-	boundaryRegex     *regexp.Regexp // Pre-compiled regex for non-array type replacement
+	boundaryRegex     *regexp.Regexp // type replacement in a column/cast position (array and non-array)
+	castRegex         *regexp.Regexp // ::type replacement not covered by boundaryRegex (e.g. ::type::text)
 	alterTypeArrayRe  *regexp.Regexp // Pre-compiled regex for ALTER COLUMN TYPE array
 	alterTypeSimpleRe *regexp.Regexp // Pre-compiled regex for ALTER COLUMN TYPE simple
 }
@@ -140,14 +141,17 @@ func (et *EnumTypeTracker) ComputeSortedPatterns() {
 		return allPatterns[i].length > allPatterns[j].length
 	})
 
-	// Pre-compile regexes for all patterns
+	// Pre-compile regexes for all patterns. The leading (^|[^\w."]) group prevents
+	// matching a type name as the suffix of a longer identifier (e.g. enum "status"
+	// inside a column named "order_status").
 	for i := range allPatterns {
 		pattern := allPatterns[i].pattern
 		quotedPattern := regexp.QuoteMeta(pattern)
 
+		allPatterns[i].boundaryRegex = regexp.MustCompile(`(^|[^\w."])` + quotedPattern + `(\s|,|;|\)|$)`)
+
 		if !strings.HasSuffix(pattern, "[]") {
-			// Boundary regex for non-array type replacement in column definitions
-			allPatterns[i].boundaryRegex = regexp.MustCompile(quotedPattern + `(\s|,|;|\)|$)`)
+			allPatterns[i].castRegex = regexp.MustCompile(`::` + quotedPattern + `([^\w\[]|$)`)
 			// ALTER COLUMN TYPE regexes
 			allPatterns[i].alterTypeArrayRe = regexp.MustCompile(`(?i)(TYPE\s+)` + quotedPattern + `\[\]`)
 			allPatterns[i].alterTypeSimpleRe = regexp.MustCompile(`(?i)(TYPE\s+)` + quotedPattern + `(\s|;|$)`)
@@ -275,6 +279,13 @@ func ConvertEnumColumnsToText(createTableSQL string, tracker *EnumTypeTracker) s
 
 // ConvertEnumTypeInLine converts ENUM types to TEXT in a single line
 // Handles column definitions, DEFAULT values with casts, etc.
+//
+// Known limitation: this is a regex-based rewrite, not a SQL parser. A column
+// whose name is exactly equal to an unqualified enum type name (e.g. a column
+// "status" of type public.status) is indistinguishable from a type occurrence on
+// a single line, so the column name itself may be rewritten to "text". A robust
+// fix requires a SQL parser (see notes on wasilibs/go-pgquery); identifiers that
+// merely contain an enum name as a prefix/suffix are handled correctly.
 func ConvertEnumTypeInLine(line string, tracker *EnumTypeTracker) string {
 	if tracker == nil {
 		return line
@@ -287,7 +298,9 @@ func ConvertEnumTypeInLine(line string, tracker *EnumTypeTracker) string {
 
 	result := line
 
-	// Use pre-computed sorted patterns (already sorted longest-first)
+	// Use pre-computed sorted patterns (already sorted longest-first).
+	// We DON'T break after a match: a line can contain multiple ENUM types
+	// (e.g. function signatures with multiple ENUM parameters).
 	for _, p := range tracker.sortedPatterns {
 		pattern := p.pattern
 
@@ -296,25 +309,16 @@ func ConvertEnumTypeInLine(line string, tracker *EnumTypeTracker) string {
 			continue
 		}
 
-		isArray := strings.HasSuffix(pattern, "[]")
-
-		if isArray {
-			// For array types, do simple string replacement
-			result = strings.ReplaceAll(result, pattern, "text[]")
-		} else {
-			// For non-array types, use pre-compiled regex to ensure we don't replace partial matches
-			// Match the pattern followed by a space, comma, semicolon, or end of string
-			if p.boundaryRegex != nil {
-				result = p.boundaryRegex.ReplaceAllString(result, "text${1}")
-			}
+		replacement := "${1}text${2}"
+		if strings.HasSuffix(pattern, "[]") {
+			replacement = "${1}text[]${2}"
 		}
+		result = p.boundaryRegex.ReplaceAllString(result, replacement)
 
-		// Also handle type casts like ::schema.type or ::type
-		result = strings.ReplaceAll(result, "::"+pattern, "::text")
-
-		// Note: We DON'T break here anymore because a line can contain multiple ENUM types
-		// (e.g., function signatures with multiple ENUM parameters)
-		// We need to check all patterns to convert all ENUMs in the line
+		// Handle casts (::type) that a trailing delimiter wouldn't cover
+		if p.castRegex != nil {
+			result = p.castRegex.ReplaceAllString(result, "::text${1}")
+		}
 	}
 
 	return result

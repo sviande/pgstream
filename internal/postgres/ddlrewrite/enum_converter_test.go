@@ -96,6 +96,62 @@ func TestConvertEnumColumnsToText(t *testing.T) {
 	}
 }
 
+func TestConvertEnumTypeInLine_IdentifierBoundaries(t *testing.T) {
+	tracker := NewEnumTypeTracker()
+	tracker.Add("public.status")
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "qualified enum type is converted",
+			input:    "    color public.status NOT NULL,",
+			expected: "    color text NOT NULL,",
+		},
+		{
+			name:     "unqualified enum type is converted",
+			input:    "    color status,",
+			expected: "    color text,",
+		},
+		{
+			name:     "array type converted while column name containing the enum name is preserved",
+			input:    "    order_status_list public.status[],",
+			expected: "    order_status_list text[],",
+		},
+		{
+			name:     "column whose name ends with the enum name is preserved",
+			input:    "    order_status integer,",
+			expected: "    order_status integer,",
+		},
+		{
+			name:     "type whose name starts with the enum name is preserved",
+			input:    "    audit public.status_history,",
+			expected: "    audit public.status_history,",
+		},
+		{
+			name:     "cast to a distinct type with the enum name as prefix is preserved",
+			input:    "    x text DEFAULT 'a'::status_history,",
+			expected: "    x text DEFAULT 'a'::status_history,",
+		},
+		{
+			name:     "cast to the enum type is converted",
+			input:    "    x text DEFAULT 'a'::status,",
+			expected: "    x text DEFAULT 'a'::text,",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ConvertEnumTypeInLine(tt.input, tracker)
+			if strings.TrimSpace(result) != strings.TrimSpace(tt.expected) {
+				t.Errorf("ConvertEnumTypeInLine():\ngot:  %q\nwant: %q", result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestConvertEnumColumnsToTextFullTable(t *testing.T) {
 	tracker := NewEnumTypeTracker()
 	tracker.Add("public.user_status")
