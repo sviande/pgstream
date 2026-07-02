@@ -195,6 +195,19 @@ func addProcessorModifiers(ctx context.Context, config *Config, logger loglib.Lo
 		processor = sanitizer.New(processor, sanitizer.WithLogger(logger))
 	}
 
+	// The renamer must wrap the writer before the transformer wraps the renamer,
+	// so the transformer runs first and looks up its rules by the source table
+	// name; renaming before transformation would silently skip the rules.
+	if config.Processor.TableRenamer != nil {
+		logger.Info("adding table renaming to processor...")
+		var err error
+		processor, err = renamer.New(processor, config.Processor.TableRenamer,
+			renamer.WithLogger(logger))
+		if err != nil {
+			return nil, nil, fmt.Errorf("error creating table renamer layer: %w", err)
+		}
+	}
+
 	if config.Processor.Transformer != nil {
 		logger.Info("adding transformation layer to processor...")
 		builderOpts := []builder.Option{}
@@ -235,16 +248,6 @@ func addProcessorModifiers(ctx context.Context, config *Config, logger loglib.Lo
 		if err != nil {
 			logger.Error(err, "creating transformer layer")
 			return nil, nil, err
-		}
-	}
-
-	if config.Processor.TableRenamer != nil {
-		logger.Info("adding table renaming to processor...")
-		var err error
-		processor, err = renamer.New(processor, config.Processor.TableRenamer,
-			renamer.WithLogger(logger))
-		if err != nil {
-			return nil, nil, fmt.Errorf("error creating table renamer layer: %w", err)
 		}
 	}
 
