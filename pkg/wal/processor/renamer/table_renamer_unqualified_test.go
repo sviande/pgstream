@@ -6,6 +6,78 @@ import (
 	"testing"
 )
 
+// TestRenameInSQL_ON_JoinConditionVsTable covers the ambiguity of the ON keyword:
+// it introduces a table in DDL (CREATE INDEX/GRANT ... ON <table>) but a boolean
+// condition over columns in a JOIN (... JOIN <t> ON <col> = ...). An unqualified
+// column after a join's ON must not be renamed, while an ON <table> must be.
+func TestRenameInSQL_ON_JoinConditionVsTable(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewTableRenamer(&Config{Rules: []Rule{
+		{Schema: "public", Match: "^(.*)$", Replace: "piana_$1"},
+	}})
+	if err != nil {
+		t.Fatalf("build renamer: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "JOIN ON unqualified column is not renamed",
+			in:   `UPDATE "A" SET x = 1 FROM "B" JOIN "C" ON "id" = "C"."cId";`,
+			want: `UPDATE "piana_A" SET x = 1 FROM "piana_B" JOIN "piana_C" ON "id" = "C"."cId";`,
+		},
+		{
+			name: "LEFT JOIN ON unqualified column is not renamed, tables are",
+			in:   `SELECT 1 FROM "A" LEFT JOIN "B" ON "aId" = "B"."id";`,
+			want: `SELECT 1 FROM "piana_A" LEFT JOIN "piana_B" ON "aId" = "B"."id";`,
+		},
+		{
+			name: "CREATE INDEX ON table is renamed (no JOIN)",
+			in:   `CREATE INDEX "idx" ON "User" ("email");`,
+			want: `CREATE INDEX "idx" ON "piana_User" ("email");`,
+		},
+		{
+			name: "GRANT ON table is renamed (no JOIN)",
+			in:   `GRANT SELECT ON "User" TO analyst;`,
+			want: `GRANT SELECT ON "piana_User" TO analyst;`,
+		},
+		{
+			name: "multi-statement: CREATE INDEX ON renamed, later JOIN ON column skipped",
+			in: `CREATE INDEX "idx" ON "User" ("email");
+UPDATE "A" SET x = 1 FROM "B" JOIN "C" ON "id" = "C"."cId";`,
+			want: `CREATE INDEX "idx" ON "piana_User" ("email");
+UPDATE "piana_A" SET x = 1 FROM "piana_B" JOIN "piana_C" ON "id" = "C"."cId";`,
+		},
+		{
+			name: "multi-statement: prior JOIN does not disable a later ON table",
+			in: `UPDATE "A" SET x = 1 FROM "B" JOIN "C" ON "id" = "C"."cId";
+CREATE INDEX "idx" ON "User" ("email");`,
+			want: `UPDATE "piana_A" SET x = 1 FROM "piana_B" JOIN "piana_C" ON "id" = "C"."cId";
+CREATE INDEX "idx" ON "piana_User" ("email");`,
+		},
+		{
+			name: "JOIN inside a comment does not disable ON table rename",
+			in: `-- backfill JOIN note
+CREATE INDEX "idx" ON "User" ("email");`,
+			want: `-- backfill JOIN note
+CREATE INDEX "idx" ON "piana_User" ("email");`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := string(r.RenameInSQL([]byte(tt.in)))
+			if got != tt.want {
+				t.Errorf("RenameInSQL()\n got:  %s\n want: %s", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestRenameInSQL_UnqualifiedTableReferences covers the CDC/DDL regression from
 // logs.txt:622 (relation "User" does not exist): live DDL often references a
 // table without a schema qualifier, which the original schema-qualified-only

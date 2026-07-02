@@ -114,17 +114,17 @@ func (r *TableRenamer) RenameInSQL(sql []byte) []byte {
 	return []byte(result)
 }
 
+// Schema-qualified table name patterns (constant; hoisted so they are compiled
+// once instead of on every renameTablesInSQLForRule call). pg_dump emits several
+// quoting forms: "schema"."table", schema."table", and schema.table.
+var (
+	quotedPattern   = regexp.MustCompile(`"([^"]+)"\."([^"]+)"`)
+	mixedPattern    = regexp.MustCompile(`\b([a-zA-Z_][a-zA-Z0-9_]*)\."([^"]+)"`)
+	unquotedPattern = regexp.MustCompile(`\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+)
+
 // renameTablesInSQLForRule applies a single rule to all table occurrences in SQL.
 func (r *TableRenamer) renameTablesInSQLForRule(sql string, rule compiledRule) string {
-	// Pattern to match schema-qualified table names in SQL.
-	// pg_dump generates different formats:
-	// 1. "schema"."table" - both quoted (rare)
-	// 2. schema."TableName" - schema unquoted, table quoted (common for mixed case)
-	// 3. schema.tablename - both unquoted (common for lowercase)
-
-	// Pattern 1: "schema"."table" - both quoted
-	quotedPattern := regexp.MustCompile(`"([^"]+)"\."([^"]+)"`)
-
 	result := quotedPattern.ReplaceAllStringFunc(sql, func(match string) string {
 		parts := quotedPattern.FindStringSubmatch(match)
 		if len(parts) != 3 {
@@ -146,9 +146,6 @@ func (r *TableRenamer) renameTablesInSQLForRule(sql string, rule compiledRule) s
 
 		return match
 	})
-
-	// Pattern 2: schema."table" - schema unquoted, table quoted (common pg_dump format)
-	mixedPattern := regexp.MustCompile(`\b([a-zA-Z_][a-zA-Z0-9_]*)\."([^"]+)"`)
 
 	result = mixedPattern.ReplaceAllStringFunc(result, func(match string) string {
 		parts := mixedPattern.FindStringSubmatch(match)
@@ -176,9 +173,6 @@ func (r *TableRenamer) renameTablesInSQLForRule(sql string, rule compiledRule) s
 
 		return match
 	})
-
-	// Pattern 3: schema.table - both unquoted (lowercase names)
-	unquotedPattern := regexp.MustCompile(`\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 
 	result = unquotedPattern.ReplaceAllStringFunc(result, func(match string) string {
 		parts := unquotedPattern.FindStringSubmatch(match)
@@ -243,6 +237,29 @@ var unqualifiedTablePattern = regexp.MustCompile(`(?i)(\b(?:TABLE|ONLY|ON|REFERE
 // function whose FROM is an argument separator rather than a clause keyword.
 var valueExprFuncStart = regexp.MustCompile(`(?i)\b(?:EXTRACT|TRIM|SUBSTRING|OVERLAY)\s*\(`)
 
+// joinKeyword matches a JOIN clause keyword.
+var joinKeyword = regexp.MustCompile(`(?i)\bJOIN\b`)
+
+// onIntroducesJoinCondition reports whether the ON at onPos is a JOIN condition
+// (a boolean expression over columns) rather than a table reference
+// ("CREATE INDEX/GRANT ... ON <table>"). ON is a join condition when a JOIN
+// keyword precedes it within the same statement (after the last top-level ';').
+func onIntroducesJoinCondition(sql string, onPos int, skipRanges [][2]int) bool {
+	stmtStart := 0
+	for i := onPos - 1; i >= 0; i-- {
+		if sql[i] == ';' && !positionInRanges(i, skipRanges) {
+			stmtStart = i + 1
+			break
+		}
+	}
+	for _, loc := range joinKeyword.FindAllStringIndex(sql[stmtStart:onPos], -1) {
+		if !positionInRanges(stmtStart+loc[0], skipRanges) {
+			return true
+		}
+	}
+	return false
+}
+
 // renameUnqualifiedTables applies a single rule to unqualified, quoted table
 // references introduced by a keyword (see unqualifiedTablePattern). It walks the
 // matches by index so it can skip matches that fall inside string literals or
@@ -292,6 +309,13 @@ func renameUnqualifiedTables(sql string, rule compiledRule) string {
 			if positionInRanges(matchStart, valueExprRanges) {
 				continue
 			}
+		}
+
+		// ON is ambiguous: "JOIN t ON <condition>" introduces a boolean condition
+		// over columns, not a table (unlike "CREATE INDEX/GRANT ... ON <table>").
+		if strings.EqualFold(strings.TrimSpace(keyword), "ON") &&
+			onIntroducesJoinCondition(sql, matchStart, skipRanges) {
+			continue
 		}
 
 		if !rule.matchRegex.MatchString(table) {
@@ -484,13 +508,15 @@ func skipBlockComment(sql string, i int) int {
 	return i
 }
 
+// reservedWords are SQL/system schema names that must not be treated as a table.
+var reservedWords = map[string]bool{
+	"pg_catalog":         true,
+	"information_schema": true,
+	"pg_toast":           true,
+	"pg_temp":            true,
+}
+
 // isReservedWord checks if a word is a SQL reserved word that should not be treated as a table name.
 func isReservedWord(word string) bool {
-	reserved := map[string]bool{
-		"pg_catalog":         true,
-		"information_schema": true,
-		"pg_toast":           true,
-		"pg_temp":            true,
-	}
-	return reserved[strings.ToLower(word)]
+	return reservedWords[strings.ToLower(word)]
 }
