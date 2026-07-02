@@ -1416,6 +1416,94 @@ func TestSnapshotGenerator_parseDump(t *testing.T) {
 	require.Equal(t, wantViewsStr, viewsStr)
 }
 
+func TestParseDump_CreateTableStatementShapes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		dump           string
+		wantInFiltered []string
+	}{
+		{
+			name:           "single-line create table",
+			dump:           `CREATE TABLE public.t (id integer);`,
+			wantInFiltered: []string{`CREATE TABLE public.t (id integer);`},
+		},
+		{
+			name:           "multi-line create table",
+			dump:           "CREATE TABLE public.users (\n    id integer NOT NULL,\n    name text\n);",
+			wantInFiltered: []string{"CREATE TABLE public.users (", "id integer NOT NULL", "name text", "\n);"},
+		},
+		{
+			name:           "single-line create table with columns ending in );",
+			dump:           `CREATE TABLE public.t (id integer, name text);`,
+			wantInFiltered: []string{`CREATE TABLE public.t (id integer, name text);`},
+		},
+		{
+			name:           "typed table ends in ; not );",
+			dump:           `CREATE TABLE public.films OF public.film_type;`,
+			wantInFiltered: []string{`CREATE TABLE public.films OF public.film_type;`},
+		},
+		{
+			name:           "partition default ends in ;",
+			dump:           `CREATE TABLE public.m_default PARTITION OF public.m DEFAULT;`,
+			wantInFiltered: []string{`CREATE TABLE public.m_default PARTITION OF public.m DEFAULT;`},
+		},
+		{
+			name:           "partition for values ends in );",
+			dump:           `CREATE TABLE public.m_y2020 PARTITION OF public.m FOR VALUES FROM ('2020-01-01') TO ('2021-01-01');`,
+			wantInFiltered: []string{`FOR VALUES FROM ('2020-01-01') TO ('2021-01-01');`},
+		},
+		{
+			name:           "multi-line typed table with WITH OPTIONS",
+			dump:           "CREATE TABLE public.films OF public.film_type (\n    title WITH OPTIONS NOT NULL\n);",
+			wantInFiltered: []string{"CREATE TABLE public.films OF public.film_type (", "title WITH OPTIONS NOT NULL", "\n);"},
+		},
+		{
+			name:           "multi-line partition ending in DEFAULT;",
+			dump:           "CREATE TABLE public.m_default\n    PARTITION OF public.m\n    DEFAULT;",
+			wantInFiltered: []string{"CREATE TABLE public.m_default", "PARTITION OF public.m", "DEFAULT;"},
+		},
+		{
+			name:           "typed table at EOF is not swallowed",
+			dump:           "CREATE TABLE public.films OF public.film_type;",
+			wantInFiltered: []string{`CREATE TABLE public.films OF public.film_type;`},
+		},
+		{
+			name:           "partition default at EOF is not swallowed",
+			dump:           "CREATE TABLE public.m_default PARTITION OF public.m DEFAULT;",
+			wantInFiltered: []string{`CREATE TABLE public.m_default PARTITION OF public.m DEFAULT;`},
+		},
+		{
+			name:           "typed table followed by another table keeps both",
+			dump:           "CREATE TABLE public.films OF public.film_type;\nCREATE TABLE public.people (id integer);",
+			wantInFiltered: []string{`CREATE TABLE public.films OF public.film_type;`, `CREATE TABLE public.people (id integer);`},
+		},
+		{
+			name:           "partition default followed by a standard multi-line table keeps both",
+			dump:           "CREATE TABLE public.m_default PARTITION OF public.m DEFAULT;\nCREATE TABLE public.orders (\n    id integer NOT NULL\n);",
+			wantInFiltered: []string{`CREATE TABLE public.m_default PARTITION OF public.m DEFAULT;`, "CREATE TABLE public.orders (", "id integer NOT NULL"},
+		},
+		{
+			name:           "typed table followed by a standard single-line table keeps both",
+			dump:           "CREATE TABLE public.a OF public.at;\nCREATE TABLE public.b (id integer);\nCREATE TABLE public.c OF public.ct;",
+			wantInFiltered: []string{`CREATE TABLE public.a OF public.at;`, `CREATE TABLE public.b (id integer);`, `CREATE TABLE public.c OF public.ct;`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			sg := &SnapshotGenerator{logger: log.NewNoopLogger()}
+			d := sg.parseDump([]byte(tt.dump))
+			filtered := string(d.filtered)
+			for _, want := range tt.wantInFiltered {
+				require.Contains(t, filtered, want, "statement missing/swallowed in filtered dump:\n%s", filtered)
+			}
+		})
+	}
+}
+
 func TestGetDumpsDiff(t *testing.T) {
 	t.Parallel()
 

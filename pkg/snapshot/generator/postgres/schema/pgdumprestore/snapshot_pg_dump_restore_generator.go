@@ -808,7 +808,7 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 			createTableBuffer.WriteString(line)
 			createTableBuffer.WriteString("\n")
 
-			if strings.HasSuffix(strings.TrimSpace(line), ");") {
+			if strings.HasSuffix(strings.TrimSpace(line), ";") {
 				// End of CREATE TABLE
 				fullCreateTable := createTableBuffer.String()
 				cleanedCreateTable := s.cleanCreateTableConstraints(fullCreateTable)
@@ -821,8 +821,9 @@ func (s *SnapshotGenerator) parseDump(d []byte) *dump {
 
 		// Detect start of CREATE TABLE
 		if strings.HasPrefix(line, "CREATE TABLE") {
-			if strings.HasSuffix(strings.TrimSpace(line), ");") {
-				// Single-line CREATE TABLE (rare)
+			if strings.HasSuffix(strings.TrimSpace(line), ";") {
+				// Complete CREATE TABLE on a single line (includes typed tables and
+				// partitions ending in ";", e.g. "... OF t;" or "... DEFAULT;")
 				cleanedLine := s.cleanCreateTableConstraints(line + "\n")
 				filteredDump.WriteString(cleanedLine)
 			} else {
