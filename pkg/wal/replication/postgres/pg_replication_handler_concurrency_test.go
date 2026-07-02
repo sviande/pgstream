@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	pglib "github.com/xataio/pgstream/internal/postgres"
@@ -91,6 +92,62 @@ func TestHandler_ConcurrentConnAccess(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestHandler_ReceiveMessage_DoesNotStarveSyncLSN verifies that a blocking
+// ReceiveMessage (an idle source) does not hold connMu long enough to starve
+// SyncLSN: the bounded receive deadline releases connMu so the checkpointer can
+// keep advancing confirmed_flush_lsn. Without the deadline the receive holds
+// connMu until the next server message and the replication slot grows unbounded.
+func TestHandler_ReceiveMessage_DoesNotStarveSyncLSN(t *testing.T) {
+	t.Parallel()
+
+	// receiving signals that ReceiveMessage has entered the mock and is holding
+	// connMu, so SyncLSN is only attempted once the receive is genuinely blocking.
+	receiving := make(chan struct{}, 1)
+	conn := &pgmocks.ReplicationConn{
+		ReceiveMessageFn: func(ctx context.Context) (*pglib.ReplicationMessage, error) {
+			select {
+			case receiving <- struct{}{}:
+			default:
+			}
+			<-ctx.Done() // block like an idle source until the receive deadline fires
+			return nil, pglib.ErrConnTimeout
+		},
+		SendStandbyStatusUpdateFn: func(ctx context.Context, lsn uint64) error { return nil },
+	}
+
+	h := Handler{
+		logger:            log.NewNoopLogger(),
+		pgReplicationConn: conn,
+		lsnParser:         NewLSNParser(),
+		logFields:         log.Fields{},
+		receiveTimeout:    50 * time.Millisecond,
+	}
+
+	ctx := t.Context()
+
+	// listener goroutine stuck in a blocking receive loop
+	go func() {
+		for ctx.Err() == nil {
+			_, _ = h.ReceiveMessage(ctx)
+		}
+	}()
+
+	<-receiving // wait until ReceiveMessage holds connMu
+
+	// the checkpointer must be able to sync despite the blocking receive
+	synced := make(chan error, 1)
+	go func() {
+		synced <- h.SyncLSN(context.Background(), replication.LSN(testLSN))
+	}()
+
+	select {
+	case err := <-synced:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("SyncLSN was starved by ReceiveMessage holding connMu across a blocking receive")
+	}
 }
 
 // TestHandler_ResetConnection_SingleFlight verifies that when two goroutines

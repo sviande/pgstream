@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"sync"
+	"time"
 
 	pglib "github.com/xataio/pgstream/internal/postgres"
 	loglib "github.com/xataio/pgstream/pkg/log"
@@ -43,7 +44,14 @@ type Handler struct {
 	// single-flight so concurrent failures trigger a single reconnect instead of
 	// each goroutine tearing down a freshly rebuilt connection.
 	connBroken bool
+	// receiveTimeout bounds each blocking ReceiveMessage so connMu is released
+	// periodically, preventing SyncLSN/Close from being starved when the source
+	// is idle (e.g. wal_sender_timeout=0). A timeout is reported as ErrConnTimeout
+	// and the listener loop simply retries.
+	receiveTimeout time.Duration
 }
+
+const defaultReceiveTimeout = 10 * time.Second
 
 type Config struct {
 	PostgresURL string
@@ -121,6 +129,7 @@ func NewHandler(ctx context.Context, cfg Config, opts ...Option) (*Handler, erro
 			logLSNPosition: sysID.XLogPos,
 		},
 		pluginArguments: defaultPluginArguments,
+		receiveTimeout:  defaultReceiveTimeout,
 	}
 
 	if cfg.PluginArguments.IncludeXIDs {
@@ -223,9 +232,18 @@ func (h *Handler) StartReplicationFromLSN(ctx context.Context, lsn replication.L
 // ReceiveMessage will listen for messages from the WAL. It returns an error if
 // an unexpected message is received.
 func (h *Handler) ReceiveMessage(ctx context.Context) (*replication.Message, error) {
+	timeout := h.receiveTimeout
+	if timeout <= 0 {
+		timeout = defaultReceiveTimeout
+	}
+
 	h.connMu.Lock()
-	pgMsg, err := h.pgReplicationConn.ReceiveMessage(ctx)
-	if err != nil && !h.isExcludedTableError(err) {
+	receiveCtx, cancel := context.WithTimeout(ctx, timeout)
+	pgMsg, err := h.pgReplicationConn.ReceiveMessage(receiveCtx)
+	cancel()
+	// A receive deadline is expected and releases connMu so SyncLSN/Close are not
+	// starved; it does not mean the connection is broken.
+	if err != nil && !h.isExcludedTableError(err) && !errors.Is(err, pglib.ErrConnTimeout) {
 		h.connBroken = true
 	}
 	h.connMu.Unlock()

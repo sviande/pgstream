@@ -408,6 +408,23 @@ func TestHandler_ReceiveMessage(t *testing.T) {
 	}
 }
 
+func TestHandler_ReceiveMessage_TimeoutDoesNotBreakConn(t *testing.T) {
+	t.Parallel()
+
+	h := Handler{
+		logger: log.NewNoopLogger(),
+		pgReplicationConn: &pgmocks.ReplicationConn{
+			ReceiveMessageFn: func(ctx context.Context) (*pglib.ReplicationMessage, error) {
+				return nil, pglib.ErrConnTimeout
+			},
+		},
+	}
+
+	_, err := h.ReceiveMessage(context.Background())
+	require.ErrorIs(t, err, replication.ErrConnTimeout)
+	require.False(t, h.connBroken, "a receive timeout must not mark the connection broken")
+}
+
 func TestHandler_GetReplicationLag(t *testing.T) {
 	t.Parallel()
 
