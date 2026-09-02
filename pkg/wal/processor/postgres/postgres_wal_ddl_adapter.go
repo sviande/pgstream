@@ -8,13 +8,14 @@ import (
 	"github.com/xataio/pgstream/pkg/wal"
 )
 
-// ddlRewriter rewrites a raw replicated DDL statement before it is applied on
-// the target (ENUM->TEXT conversion and table renaming). It returns skip=true
-// when the statement must not be applied (e.g. CREATE TYPE ... AS ENUM while
-// converting enums to text). It is implemented by the schema observer, which
-// owns the live enum tracker.
+// ddlRewriter rewrites a raw replicated DDL payload before it is applied on the
+// target (ENUM->TEXT conversion and table renaming) and returns the statements
+// to replay, one entry per statement — the captured DDL is current_query(), so
+// it may hold a whole migration file. An empty result means nothing must be
+// applied (e.g. CREATE TYPE ... AS ENUM while converting enums to text). It is
+// implemented by the schema observer, which owns the live enum tracker.
 type ddlRewriter interface {
-	RewriteDDL(ddl, commandTag string) (sql string, skip bool)
+	RewriteDDLStatements(ddl, commandTag string) []string
 }
 
 type ddlAdapter struct {
@@ -31,12 +32,11 @@ func (a *ddlAdapter) walDataToQueries(ctx context.Context, d *wal.Data) ([]*quer
 		return nil, err
 	}
 
-	sql := ddlEvent.DDL
+	statements := []string{ddlEvent.DDL}
 	if a.rewriter != nil {
-		var skip bool
-		sql, skip = a.rewriter.RewriteDDL(ddlEvent.DDL, ddlEvent.CommandTag)
-		if skip {
-			// the statement must not be applied on the target (e.g. enum type DDL)
+		statements = a.rewriter.RewriteDDLStatements(ddlEvent.DDL, ddlEvent.CommandTag)
+		if len(statements) == 0 {
+			// nothing to apply on the target (e.g. enum type DDL)
 			return []*query{{}}, nil
 		}
 	}
@@ -47,9 +47,14 @@ func (a *ddlAdapter) walDataToQueries(ctx context.Context, d *wal.Data) ([]*quer
 		tableName = tableObjects[0].GetTable()
 	}
 
-	return []*query{
-		a.newDDLQuery(ddlEvent.SchemaName, tableName, sql),
-	}, nil
+	// One query per statement: the writer executes them in order and carries on
+	// after a failure, so a statement that is already applied on the target does
+	// not take the rest of the migration down with it.
+	queries := make([]*query, 0, len(statements))
+	for _, sql := range statements {
+		queries = append(queries, a.newDDLQuery(ddlEvent.SchemaName, tableName, sql))
+	}
+	return queries, nil
 }
 
 func (a *ddlAdapter) newDDLQuery(schema, table, sql string) *query {

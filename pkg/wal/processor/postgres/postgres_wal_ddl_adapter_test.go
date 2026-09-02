@@ -223,3 +223,59 @@ func TestDDLAdapter_walDataToQueries(t *testing.T) {
 		})
 	}
 }
+
+// stubRewriter returns a fixed set of statements, standing in for the schema
+// observer.
+type stubRewriter struct{ statements []string }
+
+func (s *stubRewriter) RewriteDDLStatements(_, _ string) []string { return s.statements }
+
+// The captured DDL is current_query(), so a migration file arrives as one event
+// carrying several statements. Each must become its own query: the writer runs
+// them in order and carries on after a failure, so an "already exists" on a
+// replayed statement no longer drops the rest of the migration.
+func TestDDLAdapter_walDataToQueries_multiStatement(t *testing.T) {
+	t.Parallel()
+
+	walData := &wal.Data{
+		Action: wal.LogicalMessageAction,
+		Prefix: wal.DDLPrefix,
+		Content: `{
+			"ddl": "irrelevant, the rewriter is stubbed",
+			"schema_name": "public",
+			"command_tag": "CREATE TYPE",
+			"objects": [{"type": "table", "identity": "public.test_table", "schema": "public"}]
+		}`,
+	}
+
+	t.Run("one query per statement", func(t *testing.T) {
+		t.Parallel()
+
+		adapter := newDDLAdapter(&stubRewriter{statements: []string{
+			`CREATE TABLE "piana_test_table" ("id" TEXT);`,
+			`ALTER TABLE "piana_test_table" ADD COLUMN "c" text;`,
+		}})
+
+		queries, err := adapter.walDataToQueries(context.Background(), walData)
+		require.NoError(t, err)
+		require.Len(t, queries, 2)
+		for _, q := range queries {
+			require.True(t, q.isDDL)
+			require.Equal(t, "public", q.schema)
+			require.Equal(t, "test_table", q.table)
+		}
+		require.Equal(t, `CREATE TABLE "piana_test_table" ("id" TEXT);`, queries[0].sql)
+		require.Equal(t, `ALTER TABLE "piana_test_table" ADD COLUMN "c" text;`, queries[1].sql)
+	})
+
+	t.Run("nothing to apply yields an empty query", func(t *testing.T) {
+		t.Parallel()
+
+		adapter := newDDLAdapter(&stubRewriter{statements: nil})
+
+		queries, err := adapter.walDataToQueries(context.Background(), walData)
+		require.NoError(t, err)
+		require.Len(t, queries, 1)
+		require.True(t, queries[0].IsEmpty())
+	})
+}

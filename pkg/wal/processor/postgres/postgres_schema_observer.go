@@ -156,6 +156,18 @@ func (o *pgSchemaObserver) RewriteDDL(ddl, commandTag string) (string, bool) {
 	return ddlrewrite.RewriteDDL(ddl, commandTag, o.convertEnumsToText, o.enumTracker, tr)
 }
 
+// RewriteDDLStatements rewrites a raw replicated DDL payload for the target and
+// returns one entry per statement to replay. It is safe for concurrent use.
+func (o *pgSchemaObserver) RewriteDDLStatements(ddl, commandTag string) []string {
+	o.enumMu.Lock()
+	defer o.enumMu.Unlock()
+	var tr ddlrewrite.TableRenamer
+	if o.tableRenamer != nil {
+		tr = o.tableRenamer
+	}
+	return ddlrewrite.RewriteDDLStatements(ddl, commandTag, o.convertEnumsToText, o.enumTracker, tr)
+}
+
 // isTriggerCommandTag reports whether the DDL command tag is a trigger
 // operation: CREATE TRIGGER, CREATE CONSTRAINT TRIGGER (tag "CREATE TRIGGER"),
 // ALTER TRIGGER or DROP TRIGGER.

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"github.com/xataio/pgstream/pkg/wal/processor/renamer"
 )
 
@@ -367,4 +368,100 @@ func TestRewriteDDL_ConvertDisabledIsPassThrough(t *testing.T) {
 	if got != ddl {
 		t.Errorf("expected pass-through when convert disabled and no renamer")
 	}
+}
+
+// A migration file arrives as one current_query() payload with several
+// statements. Each must be rewritten on its own: the CREATE TYPE ... AS ENUM is
+// dropped (the target has no enums) while the CREATE TABLE that follows it
+// survives, with its enum columns turned into text.
+func TestRewriteDDL_MultiStatementMigration(t *testing.T) {
+	t.Parallel()
+
+	newTracker := func() *EnumTypeTracker {
+		tracker := NewEnumTypeTracker()
+		tracker.Add(`"MobilityProvider"`)
+		tracker.Add(`"CountryCode"`)
+		return tracker
+	}
+
+	createTable := `CREATE TABLE "MobilityLocation" (
+    "id" TEXT NOT NULL,
+    "provider" "MobilityProvider" NOT NULL,
+    "country" "CountryCode",
+    CONSTRAINT "MobilityLocation_pkey" PRIMARY KEY ("id")
+);`
+
+	tests := []struct {
+		name       string
+		ddl        string
+		commandTag string
+	}{
+		{
+			name:       "batch opening with CREATE TYPE",
+			commandTag: "CREATE TYPE",
+			ddl:        "CREATE TYPE \"MobilityProvider\" AS ENUM ('Dkv');\n" + createTable,
+		},
+		{
+			name:       "batch opening with a comment",
+			commandTag: "CREATE TYPE",
+			ddl:        "-- CreateEnum\nCREATE TYPE \"MobilityProvider\" AS ENUM ('Dkv');\n\n-- CreateTable\n" + createTable,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			sql, skip := RewriteDDL(tc.ddl, tc.commandTag, true, newTracker(), nil)
+
+			require.False(t, skip, "the batch must not be dropped: it carries a CREATE TABLE")
+			require.Contains(t, sql, `CREATE TABLE "MobilityLocation"`)
+			require.NotContains(t, sql, "AS ENUM", "enum types must not reach the target")
+			require.NotContains(t, sql, "CREATE TYPE text", "the enum name must never be rewritten in place")
+			require.Contains(t, sql, `"provider" text NOT NULL`)
+			require.Contains(t, sql, `"country" text`)
+		})
+	}
+}
+
+// A batch made only of enum DDL still collapses to a skip.
+func TestRewriteDDL_MultiStatementAllSkipped(t *testing.T) {
+	t.Parallel()
+
+	tracker := NewEnumTypeTracker()
+	tracker.Add(`"A"`)
+	tracker.Add(`"B"`)
+
+	sql, skip := RewriteDDL(
+		"CREATE TYPE \"A\" AS ENUM ('x');\nCREATE TYPE \"B\" AS ENUM ('y');",
+		"CREATE TYPE", true, tracker, nil)
+
+	require.True(t, skip)
+	require.Empty(t, sql)
+}
+
+// The tracker must learn about every enum in a batch, not just the first.
+func TestUpdateTrackerFromEnumDDL_MultiStatement(t *testing.T) {
+	t.Parallel()
+
+	tracker := NewEnumTypeTracker()
+	UpdateTrackerFromEnumDDL(tracker,
+		"CREATE TYPE",
+		"-- CreateEnum\nCREATE TYPE \"A\" AS ENUM ('x');\n\n-- CreateEnum\nCREATE TYPE \"B\" AS ENUM ('y');")
+
+	require.True(t, tracker.IsEnum(`"A"`))
+	require.True(t, tracker.IsEnum(`"B"`))
+}
+
+// A statement whose first line is a comment must still be classified by its SQL.
+func TestRewriteDDL_LeadingCommentSingleStatement(t *testing.T) {
+	t.Parallel()
+
+	tracker := NewEnumTypeTracker()
+	tracker.Add(`"P"`)
+
+	sql, skip := RewriteDDL("-- CreateEnum\nCREATE TYPE \"P\" AS ENUM ('a');", "CREATE TYPE", true, tracker, nil)
+
+	require.True(t, skip, "a commented CREATE TYPE is still a CREATE TYPE")
+	require.Empty(t, sql)
 }

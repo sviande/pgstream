@@ -16,9 +16,18 @@ type TableRenamer interface {
 
 var dropTypeRegex = regexp.MustCompile(`(?i)^\s*DROP\s+TYPE\s+(?:IF\s+EXISTS\s+)?(.+?)(?:\s+CASCADE|\s+RESTRICT)?\s*;?\s*$`)
 
-// RewriteDDL rewrites a single raw DDL statement for replication onto the
-// target, mirroring the schema snapshot generator so a table created via
-// snapshot and via live DDL replication end up identical.
+// RewriteDDL rewrites raw DDL captured from the replication stream for replay
+// onto the target, mirroring the schema snapshot generator so a table created
+// via snapshot and via live DDL replication end up identical.
+//
+// The captured DDL is current_query(): the whole query text the client sent,
+// which for a migration tool is the entire migration file. It is therefore
+// split into individual statements and each one is rewritten on its own, using
+// its own command tag; commandTag only serves as the fallback for a lone
+// statement. Rewriting a multi-statement batch as a unit applied one
+// statement's decision to all the others: a migration opening with
+// CREATE TYPE ... AS ENUM was dropped whole, taking with it the CREATE TABLE
+// that followed.
 //
 // When convertEnums is true:
 //   - CREATE TYPE ... AS ENUM, ALTER TYPE ... ADD/RENAME VALUE (and any ALTER/DROP
@@ -34,6 +43,55 @@ var dropTypeRegex = regexp.MustCompile(`(?i)^\s*DROP\s+TYPE\s+(?:IF\s+EXISTS\s+)
 // Returns the rewritten SQL and skip=true when the statement must not be applied
 // on the target.
 func RewriteDDL(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTracker, renamer TableRenamer) (sql string, skip bool) {
+	statements := RewriteDDLStatements(ddl, commandTag, convertEnums, tracker, renamer)
+	if len(statements) == 0 {
+		return "", true
+	}
+	return strings.Join(statements, "\n"), false
+}
+
+// RewriteDDLStatements rewrites the captured DDL and returns the statements to
+// replay, one entry per statement, in order. It returns an empty slice when
+// nothing must be applied on the target.
+//
+// Callers should execute the statements one by one rather than as a single
+// query: a statement that fails on the target (typically an "already exists"
+// when a DDL is replayed after a restart) then no longer takes the rest of the
+// migration down with it.
+func RewriteDDLStatements(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTracker, renamer TableRenamer) []string {
+	statements := SplitStatements(ddl)
+	if len(statements) == 0 {
+		return nil
+	}
+	// A lone statement keeps the caller-provided tag: it is the authoritative
+	// one, coming from the event trigger.
+	if len(statements) == 1 {
+		statements[0] = ddl
+	}
+
+	kept := make([]string, 0, len(statements))
+	for _, stmt := range statements {
+		tag := commandTag
+		if len(statements) > 1 {
+			tag = StatementTag(stmt)
+		}
+		stmtSQL, stmtSkip := rewriteStatement(stmt, tag, convertEnums, tracker)
+		if stmtSkip {
+			continue
+		}
+		if renamer != nil && renamer.HasRules() {
+			stmtSQL = string(renamer.RenameInSQL([]byte(stmtSQL)))
+		}
+		kept = append(kept, stmtSQL)
+	}
+	return kept
+}
+
+// rewriteStatement applies the enum-conversion rules to one statement. The
+// table renamer is deliberately left to the caller so it runs once, last, on
+// each rewritten statement — after enum conversion, so it never touches type
+// names.
+func rewriteStatement(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTracker) (sql string, skip bool) {
 	tag := strings.ToUpper(strings.TrimSpace(commandTag))
 	firstLine := firstNonEmptyLine(ddl)
 
@@ -82,10 +140,6 @@ func RewriteDDL(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTrac
 		}
 	}
 
-	if renamer != nil && renamer.HasRules() {
-		sql = string(renamer.RenameInSQL([]byte(sql)))
-	}
-
 	return sql, false
 }
 
@@ -95,6 +149,12 @@ func RewriteDDL(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTrac
 // Non-type DDL is ignored. Callers are responsible for synchronisation.
 func UpdateTrackerFromEnumDDL(tracker *EnumTypeTracker, commandTag, ddl string) {
 	if tracker == nil {
+		return
+	}
+	if statements := SplitStatements(ddl); len(statements) > 1 {
+		for _, stmt := range statements {
+			UpdateTrackerFromEnumDDL(tracker, StatementTag(stmt), stmt)
+		}
 		return
 	}
 	tag := strings.ToUpper(strings.TrimSpace(commandTag))
