@@ -1214,7 +1214,7 @@ func hasWildcardSchema(schemaTables map[string][]string) bool {
 // based on the excluded_views configuration (only wildcards are checked here,
 // specific views are excluded by pg_dump --exclude-table)
 func (s *SnapshotGenerator) shouldExcludeView(line string) bool {
-	if s.excludedViews == nil || len(s.excludedViews) == 0 {
+	if len(s.excludedViews) == 0 {
 		return false
 	}
 
@@ -1331,7 +1331,7 @@ func (s *SnapshotGenerator) removeInlineCheckConstraints(sql string) string {
 
 		// Look for named CONSTRAINT ... CHECK
 		constraintIdx := strings.Index(strings.ToUpper(sql[i:]), "CONSTRAINT ")
-		var namedCheckIdx int = -1
+		namedCheckIdx := -1
 		if constraintIdx != -1 {
 			// Check if there's a CHECK after this CONSTRAINT
 			afterConstraint := constraintIdx + 11 // len("CONSTRAINT ")

@@ -29,11 +29,7 @@ func IsEnumType(columnType string, knownEnums map[string]bool) bool {
 	// Extract just the type name without schema (handles quoted identifiers)
 	// Use the original typeName to properly handle fully quoted names like "public"."status"
 	typeOnly := extractTypeName(typeName)
-	if knownEnums[typeOnly] {
-		return true
-	}
-
-	return false
+	return knownEnums[typeOnly]
 }
 
 // extractTypeName extracts the type name from a possibly schema-qualified name.

@@ -11,7 +11,13 @@ import (
 	"github.com/xataio/pgstream/pkg/wal"
 )
 
-const maxParamsPerQuery = 60000
+const (
+	maxParamsPerQuery = 60000
+
+	// textArrayType is the array cast used for every type the target stores as
+	// text (enums are converted to text, so several branches share it).
+	textArrayType = "text[]"
+)
 
 // pgArrayType maps a PostgreSQL scalar type to its corresponding array cast
 // type for use in ANY($1::type[]) expressions.
@@ -24,11 +30,11 @@ func pgArrayType(colType string) string {
 	case "smallint", "int2":
 		return "int2[]"
 	case "text":
-		return "text[]"
+		return textArrayType
 	case "uuid":
 		return "uuid[]"
 	case "character varying", "varchar":
-		return "text[]"
+		return textArrayType
 	default:
 		return colType + "[]"
 	}
@@ -143,7 +149,7 @@ func (a *dmlAdapter) buildBulkDeleteSinglePK(events []*wal.Data, refCol wal.Colu
 	// when converting enums to text, an enum-typed PK column is TEXT on the
 	// target, so the source enum array type does not exist there: cast to text[].
 	if a.convertEnumsToText && a.isEnumType != nil && a.isEnumType(refCol.Type) {
-		arrayType = "text[]"
+		arrayType = textArrayType
 	}
 	sql := fmt.Sprintf("DELETE FROM %s WHERE %s = ANY($1::%s)", tableName, colName, arrayType)
 
