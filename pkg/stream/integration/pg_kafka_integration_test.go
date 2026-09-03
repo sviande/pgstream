@@ -137,7 +137,6 @@ func Test_PostgresToKafka(t *testing.T) {
 			for {
 				select {
 				case <-timer.C:
-					cancel()
 					t.Error("timeout waiting for wal event")
 					return
 				case event := <-mockProcessor.eventChan:

@@ -114,7 +114,6 @@ func Test_PostgresToPostgres_Transformer(t *testing.T) {
 			for {
 				select {
 				case <-timer.C:
-					cancel()
 					t.Error("timeout waiting for postgres sync")
 					return
 				case <-ticker.C:

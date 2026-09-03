@@ -115,7 +115,6 @@ func Test_PostgresToSearch(t *testing.T) {
 				for {
 					select {
 					case <-timer.C:
-						cancel()
 						t.Error("timeout waiting for opensearch data")
 						return
 					case <-ticker.C:

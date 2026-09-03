@@ -127,7 +127,6 @@ func Test_PostgresToWebhook(t *testing.T) {
 			for {
 				select {
 				case <-timer.C:
-					cancel()
 					t.Error("timeout waiting for webhook payload")
 					return
 				case data := <-mockWebhookServer.dataChan:
