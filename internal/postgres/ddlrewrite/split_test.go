@@ -5,6 +5,7 @@ package ddlrewrite
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -107,5 +108,112 @@ func TestStatementTag(t *testing.T) {
 			t.Parallel()
 			require.Equal(t, tc.want, StatementTag(tc.stmt))
 		})
+	}
+}
+
+func TestStatementTagTerminatesOnDelimiterOnly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		stmt string
+		want string
+	}{
+		{stmt: ";", want: ""},
+		{stmt: "  ;", want: ""},
+		{stmt: "-- comment\n;", want: ""},
+		{stmt: "(\"id\" TEXT);", want: ""},
+		{stmt: "CREATE(", want: "CREATE"},
+		{stmt: "CREATE ;", want: "CREATE"},
+		{stmt: "", want: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.stmt, func(t *testing.T) {
+			t.Parallel()
+			done := make(chan string, 1)
+			go func() { done <- StatementTag(tc.stmt) }()
+			select {
+			case got := <-done:
+				require.Equal(t, tc.want, got)
+			case <-time.After(2 * time.Second):
+				t.Fatalf("StatementTag(%q) did not terminate", tc.stmt)
+			}
+		})
+	}
+}
+
+func TestSplitStatementsDropsStrayDelimiters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "double semicolon",
+			sql:  `CREATE TABLE "a" ("id" TEXT);;CREATE TABLE "b" ("id" TEXT);`,
+			want: []string{`CREATE TABLE "a" ("id" TEXT);`, `CREATE TABLE "b" ("id" TEXT);`},
+		},
+		{
+			name: "spaced stray semicolon",
+			sql:  "CREATE TABLE \"a\" (\"id\" TEXT);\n ; \nCREATE TABLE \"b\" (\"id\" TEXT);",
+			want: []string{`CREATE TABLE "a" ("id" TEXT);`, `CREATE TABLE "b" ("id" TEXT);`},
+		},
+		{
+			name: "only semicolons",
+			sql:  ";;;",
+			want: nil,
+		},
+		{
+			name: "semicolon inside literal is kept",
+			sql:  `INSERT INTO "a" VALUES (';');;`,
+			want: []string{`INSERT INTO "a" VALUES (';');`},
+		},
+		{
+			name: "comment followed by stray semicolon",
+			sql:  "CREATE TABLE \"a\" (\"id\" TEXT);\n-- end of migration\n;",
+			want: []string{`CREATE TABLE "a" ("id" TEXT);`},
+		},
+		{
+			name: "trailing comment without semicolon",
+			sql:  "CREATE TABLE \"a\" (\"id\" TEXT);\n/* end */",
+			want: []string{`CREATE TABLE "a" ("id" TEXT);`},
+		},
+		{
+			name: "parenthesised statement is not blank",
+			sql:  `CREATE TABLE "a" ("id" TEXT);(SELECT 1);`,
+			want: []string{`CREATE TABLE "a" ("id" TEXT);`, `(SELECT 1);`},
+		},
+		{
+			name: "leading comment stays attached to its statement",
+			sql:  "-- CreateTable\nCREATE TABLE \"a\" (\"id\" TEXT);",
+			want: []string{"-- CreateTable\nCREATE TABLE \"a\" (\"id\" TEXT);"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, SplitStatements(tc.sql))
+		})
+	}
+}
+
+func TestUpdateTrackerFromEnumDDLTerminatesOnStraySemicolon(t *testing.T) {
+	t.Parallel()
+
+	tracker := NewEnumTypeTracker()
+	ddl := "-- CreateEnum\nCREATE TYPE \"P\" AS ENUM ('a');;\n-- CreateTable\nCREATE TABLE \"t\" (\"p\" \"P\");"
+	done := make(chan struct{})
+	go func() {
+		UpdateTrackerFromEnumDDL(tracker, "CREATE TYPE", ddl)
+		close(done)
+	}()
+	select {
+	case <-done:
+		require.True(t, tracker.IsEnum("P"))
+	case <-time.After(2 * time.Second):
+		t.Fatal("UpdateTrackerFromEnumDDL did not terminate")
 	}
 }

@@ -114,7 +114,7 @@ func SplitStatements(sql string) []string {
 			}
 		case ch == ';':
 			current.WriteRune(ch)
-			if stmt := strings.TrimSpace(current.String()); stmt != "" {
+			if stmt := strings.TrimSpace(current.String()); !isBlankStatement(stmt) {
 				statements = append(statements, stmt)
 			}
 			current.Reset()
@@ -124,11 +124,36 @@ func SplitStatements(sql string) []string {
 		current.WriteRune(ch)
 	}
 
-	if stmt := strings.TrimSpace(current.String()); stmt != "" {
+	if stmt := strings.TrimSpace(current.String()); !isBlankStatement(stmt) {
 		statements = append(statements, stmt)
 	}
 
 	return statements
+}
+
+func isBlankStatement(stmt string) bool {
+	rest := stmt
+	for {
+		rest = strings.TrimLeft(rest, " \t\r\n;")
+		switch {
+		case rest == "":
+			return true
+		case strings.HasPrefix(rest, "--"):
+			idx := strings.IndexByte(rest, '\n')
+			if idx == -1 {
+				return true
+			}
+			rest = rest[idx+1:]
+		case strings.HasPrefix(rest, "/*"):
+			idx := strings.Index(rest, "*/")
+			if idx == -1 {
+				return true
+			}
+			rest = rest[idx+2:]
+		default:
+			return false
+		}
+	}
 }
 
 // dollarQuoteTag returns the dollar-quote tag starting at position i ("$$",
@@ -197,10 +222,10 @@ func leadingWords(stmt string, n int) []string {
 		if end == -1 {
 			end = len(rest)
 		}
-		word := strings.ToUpper(rest[:end])
-		if word != "" {
-			words = append(words, word)
+		if end == 0 {
+			return words
 		}
+		words = append(words, strings.ToUpper(rest[:end]))
 		if end == len(rest) {
 			return words
 		}

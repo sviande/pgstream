@@ -4,6 +4,7 @@ package postgres
 
 import (
 	"context"
+	"unicode/utf8"
 
 	loglib "github.com/xataio/pgstream/pkg/log"
 	"github.com/xataio/pgstream/pkg/wal"
@@ -47,6 +48,8 @@ type adapter struct {
 	ddlEventAdapter ddlEventAdapter
 
 	schemaObserver schemaObserver
+
+	logger loglib.Logger
 }
 
 type (
@@ -74,6 +77,7 @@ func newAdapter(ctx context.Context, logger loglib.Logger, ignoreDDL bool, pgURL
 		ddlAdapter:      ddl,
 		schemaObserver:  schemaObserver,
 		ddlEventAdapter: wal.WalDataToDDLEvent,
+		logger:          logger,
 	}, nil
 }
 
@@ -138,6 +142,12 @@ func (a *adapter) walEventToMessage(ctx context.Context, e *wal.Event) (*walMess
 		if err != nil {
 			return nil, err
 		}
+		if a.logger != nil {
+			a.logger.Debug("processing DDL event", loglib.Fields{
+				"command_tag": ddlEvent.CommandTag,
+				"ddl":         truncateDDL(ddlEvent.DDL, maxLoggedDDLBytes),
+			})
+		}
 		a.schemaObserver.update(ddlEvent)
 
 		if a.ddlAdapter == nil {
@@ -179,4 +189,17 @@ func (a *adapter) isEnumType(colType string) bool {
 
 func (a *adapter) close() error {
 	return a.schemaObserver.close()
+}
+
+const maxLoggedDDLBytes = 4096
+
+func truncateDDL(ddl string, max int) string {
+	if len(ddl) <= max {
+		return ddl
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(ddl[cut]) {
+		cut--
+	}
+	return ddl[:cut] + "…[truncated]"
 }

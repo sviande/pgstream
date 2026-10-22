@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 	"github.com/xataio/pgstream/pkg/wal"
@@ -461,6 +463,33 @@ func TestAdapter_walEventToQueries(t *testing.T) {
 			queries, err := a.walEventToQueries(context.Background(), tc.event)
 			require.ErrorIs(t, err, tc.wantErr)
 			require.ElementsMatch(t, tc.wantQueries, queries)
+		})
+	}
+}
+
+func TestTruncateDDL(t *testing.T) {
+	t.Parallel()
+
+	ascii := strings.Repeat("a", 4095)
+	tests := []struct {
+		name string
+		ddl  string
+		max  int
+		want string
+	}{
+		{name: "short", ddl: "CREATE TABLE t ();", max: 4096, want: "CREATE TABLE t ();"},
+		{name: "exact", ddl: "abcd", max: 4, want: "abcd"},
+		{name: "ascii cut", ddl: "abcdef", max: 4, want: "abcd…[truncated]"},
+		{name: "multibyte at boundary", ddl: ascii + "é" + "x", max: 4096, want: ascii + "…[truncated]"},
+		{name: "multibyte fully inside", ddl: "é" + ascii + "x", max: 4096, want: "é" + ascii[:4094] + "…[truncated]"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := truncateDDL(tc.ddl, tc.max)
+			require.Equal(t, tc.want, got)
+			require.True(t, utf8.ValidString(got))
 		})
 	}
 }
