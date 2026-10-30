@@ -40,6 +40,13 @@ type pgSchemaObserver struct {
 	// TRIGGER) so triggers are never applied on the target, consistent with the
 	// schema snapshot's exclude_triggers behaviour.
 	excludeTriggers bool
+	// excludeForeignKeys and excludeCheckConstraints, when true, drop the
+	// replicated ALTER TABLE statements that only add foreign keys or CHECK
+	// constraints and strip these table constraints from CREATE TABLE,
+	// consistent with the schema snapshot's exclude_foreign_keys and
+	// exclude_check_constraints behaviour.
+	excludeForeignKeys      bool
+	excludeCheckConstraints bool
 	// tableRenamer, when set, rewrites table identifiers in replicated DDL.
 	tableRenamer *renamer.TableRenamer
 	// enumMu guards enumTracker, which is not safe for concurrent use.
@@ -54,7 +61,15 @@ type pgSchemaObserver struct {
 // including generated table columns and materialized views. It keeps a cache to
 // reduce the number of calls to postgres, and it updates the state whenever a
 // DDL event is received through the WAL.
-func newPGSchemaObserver(ctx context.Context, pgURL, sourceURL string, convertEnumsToText, excludeTriggers bool, tableRenamer *renamer.TableRenamer, logger loglib.Logger) (*pgSchemaObserver, error) {
+// excludedDDL selects the replicated DDL that is never applied on the target,
+// matching what the schema snapshot leaves out.
+type excludedDDL struct {
+	triggers         bool
+	foreignKeys      bool
+	checkConstraints bool
+}
+
+func newPGSchemaObserver(ctx context.Context, pgURL, sourceURL string, convertEnumsToText bool, excluded excludedDDL, tableRenamer *renamer.TableRenamer, logger loglib.Logger) (*pgSchemaObserver, error) {
 	pgConn, err := pglib.NewConnPool(ctx, pgURL)
 	if err != nil {
 		return nil, err
@@ -67,7 +82,9 @@ func newPGSchemaObserver(ctx context.Context, pgURL, sourceURL string, convertEn
 		columnTableSequences:       synclib.NewMap[string, map[string]string](),
 		logger:                     logger,
 		convertEnumsToText:         convertEnumsToText,
-		excludeTriggers:            excludeTriggers,
+		excludeTriggers:            excluded.triggers,
+		excludeForeignKeys:         excluded.foreignKeys,
+		excludeCheckConstraints:    excluded.checkConstraints,
 		tableRenamer:               tableRenamer,
 		enumTracker:                ddlrewrite.NewEnumTypeTracker(),
 	}
@@ -154,7 +171,10 @@ func (o *pgSchemaObserver) RewriteDDLStatements(ddl, commandTag string) []string
 		if o.excludeTriggers && isTriggerCommandTag(stmt.Tag) {
 			continue
 		}
-		sqls = append(sqls, stmt.SQL)
+		if ddlrewrite.AddsOnlyExcludedConstraints(stmt.SQL, o.excludeForeignKeys, o.excludeCheckConstraints) {
+			continue
+		}
+		sqls = append(sqls, ddlrewrite.StripExcludedTableConstraints(stmt.SQL, o.excludeForeignKeys, o.excludeCheckConstraints))
 	}
 	return sqls
 }

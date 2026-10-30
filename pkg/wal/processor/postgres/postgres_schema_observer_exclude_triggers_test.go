@@ -3,6 +3,7 @@
 package postgres
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -112,5 +113,48 @@ $$ LANGUAGE plpgsql;`
 				require.Equal(t, tc.want, o.RewriteDDLStatements(payload, commandTag))
 			})
 		}
+	}
+}
+
+// Foreign keys and CHECK constraints, added by ALTER TABLE or declared in
+// CREATE TABLE, are dropped like the schema snapshot drops them; the rest of
+// the migration is still replayed.
+func TestPGSchemaObserver_RewriteDDLStatements_ExcludeConstraints(t *testing.T) {
+	t.Parallel()
+
+	const createTable = `-- CreateTable
+CREATE TABLE "HomeChargingVehicleHistory" ("id" TEXT NOT NULL, "homeChargingVehicleId" TEXT NOT NULL, CONSTRAINT "HomeChargingVehicleHistory_pkey" PRIMARY KEY ("id"), CONSTRAINT "HomeChargingVehicleHistory_vehicle_check" CHECK ("homeChargingVehicleId" <> ''));`
+	const createTableWithoutCheck = `-- CreateTable
+CREATE TABLE "HomeChargingVehicleHistory" ("id" TEXT NOT NULL, "homeChargingVehicleId" TEXT NOT NULL, CONSTRAINT "HomeChargingVehicleHistory_pkey" PRIMARY KEY ("id"));`
+	const createIndex = `-- CreateIndex
+CREATE INDEX "HomeChargingVehicleHistory_homeChargingVehicleId_idx" ON "HomeChargingVehicleHistory"("homeChargingVehicleId");`
+	const foreignKey = `-- AddForeignKey
+ALTER TABLE "HomeChargingVehicleHistory" ADD CONSTRAINT "HomeChargingVehicleHistory_homeChargingVehicleId_fkey" FOREIGN KEY ("homeChargingVehicleId") REFERENCES "HomeChargingVehicle"("id") ON DELETE CASCADE ON UPDATE CASCADE;`
+	const check = `ALTER TABLE "HomeChargingVehicleHistory" ADD CONSTRAINT "HomeChargingVehicleHistory_id_check" CHECK ("id" <> '');`
+	const unique = `ALTER TABLE "HomeChargingVehicleHistory" ADD CONSTRAINT "HomeChargingVehicleHistory_id_key" UNIQUE ("id");`
+	payload := strings.Join([]string{createTable, createIndex, foreignKey, check, unique}, "\n\n")
+
+	tests := []struct {
+		name        string
+		foreignKeys bool
+		checks      bool
+		want        []string
+	}{
+		{name: "both excluded", foreignKeys: true, checks: true, want: []string{createTableWithoutCheck, createIndex, unique}},
+		{name: "foreign keys excluded", foreignKeys: true, want: []string{createTable, createIndex, check, unique}},
+		{name: "checks excluded", checks: true, want: []string{createTableWithoutCheck, createIndex, foreignKey, unique}},
+		{name: "nothing excluded", want: []string{createTable, createIndex, foreignKey, check, unique}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := &pgSchemaObserver{
+				excludeForeignKeys:      tc.foreignKeys,
+				excludeCheckConstraints: tc.checks,
+				enumTracker:             ddlrewrite.NewEnumTypeTracker(),
+			}
+			require.Equal(t, tc.want, o.RewriteDDLStatements(payload, "ALTER TABLE"))
+		})
 	}
 }

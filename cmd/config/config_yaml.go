@@ -726,14 +726,16 @@ func (c *YAMLConfig) parsePostgresProcessorConfig() (*stream.PostgresProcessorCo
 
 	cfg := &stream.PostgresProcessorConfig{
 		BatchWriter: postgres.Config{
-			URL:                c.Target.Postgres.URL,
-			BatchConfig:        c.Target.Postgres.Batch.parseBatchConfig(),
-			DisableTriggers:    c.Target.Postgres.DisableTriggers,
-			OnConflictAction:   c.Target.Postgres.OnConflictAction,
-			RetryPolicy:        c.Target.Postgres.RetryPolicy.parseBackoffConfig(),
-			IgnoreDDL:          c.Target.Postgres.IgnoreDDL,
-			ExcludeTriggers:    c.Target.Postgres.ExcludeTriggers,
-			ConvertEnumsToText: c.Target.Postgres.ConvertEnumsToText,
+			URL:                     c.Target.Postgres.URL,
+			BatchConfig:             c.Target.Postgres.Batch.parseBatchConfig(),
+			DisableTriggers:         c.Target.Postgres.DisableTriggers,
+			OnConflictAction:        c.Target.Postgres.OnConflictAction,
+			RetryPolicy:             c.Target.Postgres.RetryPolicy.parseBackoffConfig(),
+			IgnoreDDL:               c.Target.Postgres.IgnoreDDL,
+			ExcludeTriggers:         c.Target.Postgres.ExcludeTriggers,
+			ExcludeForeignKeys:      c.Target.Postgres.ExcludeForeignKeys,
+			ExcludeCheckConstraints: c.Target.Postgres.ExcludeCheckConstraints,
+			ConvertEnumsToText:      c.Target.Postgres.ConvertEnumsToText,
 		},
 	}
 

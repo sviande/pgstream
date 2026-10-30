@@ -62,7 +62,11 @@ func newWriter(ctx context.Context, config *Config, writerType string, opts ...W
 
 	forCopy := writerType == bulkIngestWriter
 
-	w.adapter, err = newAdapter(ctx, w.logger, config.IgnoreDDL, config.URL, config.OnConflictAction, forCopy, config.SourceURL, config.ConvertEnumsToText, config.ExcludeTriggers, config.TableRenamer)
+	w.adapter, err = newAdapter(ctx, w.logger, config.IgnoreDDL, config.URL, config.OnConflictAction, forCopy, config.SourceURL, config.ConvertEnumsToText, excludedDDL{
+		triggers:         config.ExcludeTriggers,
+		foreignKeys:      config.ExcludeForeignKeys,
+		checkConstraints: config.ExcludeCheckConstraints,
+	}, config.TableRenamer)
 	if err != nil {
 		return nil, err
 	}

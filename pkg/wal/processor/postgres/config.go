@@ -23,6 +23,13 @@ type Config struct {
 	// exclude_triggers behaviour. Without it, trigger DDL is only filtered from
 	// the initial snapshot but still replayed live during CDC.
 	ExcludeTriggers bool
+	// ExcludeForeignKeys and ExcludeCheckConstraints, when true, skip the
+	// replicated ALTER TABLE statements that only add foreign keys or CHECK
+	// constraints, matching the schema snapshot's exclude_foreign_keys and
+	// exclude_check_constraints behaviour. Without them, these constraints are
+	// only filtered from the initial snapshot but still replayed live during CDC.
+	ExcludeForeignKeys      bool
+	ExcludeCheckConstraints bool
 	// SourceURL is the source database URL. It is only used to bootstrap the
 	// set of existing ENUM types when ConvertEnumsToText is enabled, so that DDL
 	// referencing a pre-existing enum is converted even though its CREATE TYPE
