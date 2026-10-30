@@ -35,9 +35,10 @@ type Handler struct {
 	// connMu serializes every access to pgReplicationConn. The replication
 	// connection (pgconn) is not safe for concurrent use: ReceiveMessage runs in
 	// the listener goroutine while SyncLSN (SendStandbyStatusUpdate) runs in the
-	// checkpointer goroutine, and ResetConnection swaps the connection. Without
-	// this lock those accesses race and corrupt the CopyBoth protocol stream
-	// (observed in production as "unexpected message: ReadyForQuery" desyncs).
+	// checkpointer goroutine, the heartbeat runs in its own, and ResetConnection
+	// swaps the connection. Without this lock those accesses race and corrupt
+	// the CopyBoth protocol stream (observed in production as "unexpected
+	// message: ReadyForQuery" desyncs).
 	connMu sync.Mutex
 	// connBroken is set by a failing ReceiveMessage/SyncLSN and cleared once
 	// ResetConnection has rebuilt the connection. It makes ResetConnection
@@ -49,9 +50,29 @@ type Handler struct {
 	// is idle (e.g. wal_sender_timeout=0). A timeout is reported as ErrConnTimeout
 	// and the listener loop simply retries.
 	receiveTimeout time.Duration
+
+	// The source drops the connection when it hears nothing from us for
+	// wal_sender_timeout, but the LSN is only synced once the writer has
+	// written a batch: a reply to a keepalive queued behind the batches, or a
+	// batch taking longer than the timeout, got the stream cut and replayed
+	// from the last synced LSN. Any status update counts as a reply, so the
+	// keepalive replies and the heartbeat resend lastSyncedLSN: they keep the
+	// connection alive without confirming anything the writer has not synced.
+	// Guarded by connMu.
+	lastSyncedLSN replication.LSN
+	// heartbeatInterval is how often the heartbeat sends a status update once
+	// replication has started; zero disables it.
+	heartbeatInterval time.Duration
+	heartbeatCtx      context.Context
+	stopHeartbeat     context.CancelFunc
+	startHeartbeat    sync.Once
 }
 
-const defaultReceiveTimeout = 10 * time.Second
+const (
+	defaultReceiveTimeout = 10 * time.Second
+	// defaultHeartbeatInterval matches the pg_recvlogical status interval.
+	defaultHeartbeatInterval = 10 * time.Second
+)
 
 type Config struct {
 	PostgresURL string
@@ -128,9 +149,11 @@ func NewHandler(ctx context.Context, cfg Config, opts ...Option) (*Handler, erro
 			logSlotName:    replicationSlotName,
 			logLSNPosition: sysID.XLogPos,
 		},
-		pluginArguments: defaultPluginArguments,
-		receiveTimeout:  defaultReceiveTimeout,
+		pluginArguments:   defaultPluginArguments,
+		receiveTimeout:    defaultReceiveTimeout,
+		heartbeatInterval: defaultHeartbeatInterval,
 	}
+	h.heartbeatCtx, h.stopHeartbeat = context.WithCancel(ctx)
 
 	if cfg.PluginArguments.IncludeXIDs {
 		h.pluginArguments = append(h.pluginArguments, `"include-xids" '1'`)
@@ -226,7 +249,15 @@ func (h *Handler) StartReplicationFromLSN(ctx context.Context, lsn replication.L
 
 	// syncLSNLocked (not SyncLSN) avoids re-acquiring connMu: this runs either at
 	// startup (single-threaded) or from ResetConnection, which already holds it.
-	return h.syncLSNLocked(ctx, lsn)
+	if err := h.syncLSNLocked(ctx, lsn); err != nil {
+		return err
+	}
+
+	// the connection only takes status updates once replication has started
+	if h.heartbeatInterval > 0 && h.heartbeatCtx != nil {
+		h.startHeartbeat.Do(func() { go h.heartbeat(h.heartbeatCtx) })
+	}
+	return nil
 }
 
 // ReceiveMessage will listen for messages from the WAL. It returns an error if
@@ -245,6 +276,13 @@ func (h *Handler) ReceiveMessage(ctx context.Context) (*replication.Message, err
 	// starved; it does not mean the connection is broken.
 	if err != nil && !h.isExcludedTableError(err) && !errors.Is(err, pglib.ErrConnTimeout) {
 		h.connBroken = true
+	}
+	// Answer a keepalive at once rather than once the writer catches up with
+	// it: the source cuts the stream when the reply is late.
+	if err == nil && pgMsg.ReplyRequested {
+		replyCtx, cancel := context.WithTimeout(ctx, timeout)
+		err = h.syncLSNLocked(replyCtx, h.lastSyncedLSN)
+		cancel()
 	}
 	h.connMu.Unlock()
 
@@ -282,10 +320,42 @@ func (h *Handler) syncLSNLocked(ctx context.Context, lsn replication.LSN) error 
 		h.connBroken = true
 		return fmt.Errorf("syncLSN: send status update: %w", err)
 	}
+	h.lastSyncedLSN = lsn
 	h.logger.Trace("stored new LSN position", loglib.Fields{
 		logLSNPosition: h.lsnParser.ToString(lsn),
 	})
 	return nil
+}
+
+// heartbeat sends a status update every heartbeatInterval until ctx is done,
+// so the source keeps the connection while the writer is busy and the
+// listener blocked behind it.
+func (h *Handler) heartbeat(ctx context.Context) {
+	ticker := time.NewTicker(h.heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := h.sendHeartbeat(ctx); err != nil {
+				h.logger.Warn(err, "sending replication heartbeat")
+			}
+		}
+	}
+}
+
+// sendHeartbeat resends the last synced LSN. A broken connection is left to
+// the listener, which rebuilds it on its next receive.
+func (h *Handler) sendHeartbeat(ctx context.Context) error {
+	h.connMu.Lock()
+	defer h.connMu.Unlock()
+	if h.connBroken || ctx.Err() != nil {
+		return nil
+	}
+	sendCtx, cancel := context.WithTimeout(ctx, h.heartbeatInterval)
+	defer cancel()
+	return h.syncLSNLocked(sendCtx, h.lastSyncedLSN)
 }
 
 // GetReplicationLag will return the consumer current replication lag. This
@@ -362,6 +432,9 @@ func (h *Handler) GetLSNParser() replication.LSNParser {
 
 // Close closes the database connections.
 func (h *Handler) Close() error {
+	if h.stopHeartbeat != nil {
+		h.stopHeartbeat()
+	}
 	h.connMu.Lock()
 	defer h.connMu.Unlock()
 	return h.pgReplicationConn.Close(context.Background())

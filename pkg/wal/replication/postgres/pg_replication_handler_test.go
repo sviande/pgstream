@@ -425,6 +425,71 @@ func TestHandler_ReceiveMessage_TimeoutDoesNotBreakConn(t *testing.T) {
 	require.False(t, h.connBroken, "a receive timeout must not mark the connection broken")
 }
 
+func TestHandler_ReceiveMessage_RepliesToKeepalive(t *testing.T) {
+	t.Parallel()
+
+	serverWALEnd := testLSN + 1000
+
+	tests := []struct {
+		name    string
+		sendErr error
+
+		wantMessage    *replication.Message
+		wantErr        error
+		wantConnBroken bool
+	}{
+		{
+			name: "ok",
+
+			wantMessage: &replication.Message{
+				LSN:            replication.LSN(serverWALEnd),
+				ServerTime:     now,
+				ReplyRequested: true,
+			},
+		},
+		{
+			name:    "error - sending reply",
+			sendErr: errTest,
+
+			wantErr:        errTest,
+			wantConnBroken: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var sentLSNs []uint64
+			h := Handler{
+				logger: log.NewNoopLogger(),
+				pgReplicationConn: &pgmocks.ReplicationConn{
+					ReceiveMessageFn: func(ctx context.Context) (*pglib.ReplicationMessage, error) {
+						return &pglib.ReplicationMessage{
+							LSN:            serverWALEnd,
+							ServerTime:     now,
+							ReplyRequested: true,
+						}, nil
+					},
+					SendStandbyStatusUpdateFn: func(ctx context.Context, lsn uint64) error {
+						sentLSNs = append(sentLSNs, lsn)
+						return tc.sendErr
+					},
+				},
+				lsnParser:     NewLSNParser(),
+				lastSyncedLSN: replication.LSN(testLSN),
+			}
+
+			msg, err := h.ReceiveMessage(context.Background())
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Equal(t, tc.wantMessage, msg)
+			// the reply confirms what the writer synced, not the server WAL end
+			require.Equal(t, []uint64{testLSN}, sentLSNs)
+			require.Equal(t, tc.wantConnBroken, h.connBroken)
+		})
+	}
+}
+
 func TestHandler_GetReplicationLag(t *testing.T) {
 	t.Parallel()
 

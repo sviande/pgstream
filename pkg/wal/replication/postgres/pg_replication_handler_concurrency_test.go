@@ -17,8 +17,9 @@ import (
 )
 
 // TestHandler_ConcurrentConnAccess exercises ReceiveMessage (listener goroutine),
-// SyncLSN (checkpointer goroutine) and ResetConnection concurrently. Run with
-// -race: without Handler.connMu the shared mock state and the pgReplicationConn
+// SyncLSN (checkpointer goroutine), the heartbeat and ResetConnection
+// concurrently. Run with -race: without Handler.connMu the shared mock state
+// and the pgReplicationConn
 // swap race, which is the root cause of the production "unexpected message:
 // ReadyForQuery" desyncs.
 func TestHandler_ConcurrentConnAccess(t *testing.T) {
@@ -63,11 +64,14 @@ func TestHandler_ConcurrentConnAccess(t *testing.T) {
 		lsnParser:             NewLSNParser(),
 		logFields:             log.Fields{},
 		pluginArguments:       defaultPluginArguments,
+		// the first reset starts the heartbeat goroutine
+		heartbeatInterval: time.Millisecond,
+		heartbeatCtx:      t.Context(),
 	}
 
 	const iterations = 200
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	go func() { // listener
 		defer wg.Done()
@@ -79,6 +83,12 @@ func TestHandler_ConcurrentConnAccess(t *testing.T) {
 		defer wg.Done()
 		for range iterations {
 			_ = h.SyncLSN(context.Background(), replication.LSN(testLSN))
+		}
+	}()
+	go func() { // heartbeat
+		defer wg.Done()
+		for range iterations {
+			_ = h.sendHeartbeat(context.Background())
 		}
 	}()
 	go func() { // reconnector
