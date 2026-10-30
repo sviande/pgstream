@@ -216,7 +216,71 @@ func (r *TableRenamer) renameTablesInSQLForRule(sql string, rule compiledRule) s
 	// a value-expression function is filtered out (see renameUnqualifiedTables).
 	result = renameUnqualifiedTables(result, rule)
 
+	// Pattern 5: the new name of a table renamed by ALTER TABLE ... RENAME TO
+	// (see renameTableRenameTargets).
+	result = renameTableRenameTargets(result, rule)
+
 	return result
+}
+
+// identifierPattern matches one identifier, quoted (with "" escapes) or not.
+const identifierPattern = `(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)`
+
+// alterTableRenameToPattern matches ALTER TABLE <table> RENAME TO <name>. The
+// first group captures the schema of a qualified table, the second the new name.
+var alterTableRenameToPattern = regexp.MustCompile(`(?i)\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?` +
+	`(?:(` + identifierPattern + `)\s*\.\s*)?` + identifierPattern + `\s+RENAME\s+TO\s+(` + identifierPattern + `)`)
+
+// renameTableRenameTargets applies a single rule to the new name of the tables
+// renamed by ALTER TABLE ... RENAME TO. That name follows no keyword of
+// unqualifiedTablePattern, and TO cannot be one: it also introduces names the
+// renamer leaves alone (RENAME COLUMN/CONSTRAINT ... TO, ALTER INDEX/SEQUENCE/
+// TYPE ... RENAME TO, OWNER TO, GRANT ... TO). Left as is, the target table
+// took the source name while the rows that follow, renamed by RenameTable, went
+// to a table that did not exist.
+//
+// The new name is unqualified and lives in the schema of the table renamed: the
+// rule's schema filter applies when that table is qualified, and is assumed to
+// match otherwise, as for the other unqualified names.
+func renameTableRenameTargets(sql string, rule compiledRule) string {
+	matches := alterTableRenameToPattern.FindAllStringSubmatchIndex(sql, -1)
+	if len(matches) == 0 {
+		return sql
+	}
+
+	skipRanges := literalAndCommentRanges(sql)
+
+	var b strings.Builder
+	last := 0
+	for _, m := range matches {
+		if positionInRanges(m[0], skipRanges) {
+			continue
+		}
+		if m[2] >= 0 && rule.schema != "*" && rule.schema != identifierName(sql[m[2]:m[3]]) {
+			continue
+		}
+
+		table := identifierName(sql[m[4]:m[5]])
+		if !rule.matchRegex.MatchString(table) {
+			continue
+		}
+
+		newTable := rule.matchRegex.ReplaceAllString(table, rule.replaceStr)
+		b.WriteString(sql[last:m[4]])
+		b.WriteString(`"` + strings.ReplaceAll(newTable, `"`, `""`) + `"`)
+		last = m[5]
+	}
+	b.WriteString(sql[last:])
+	return b.String()
+}
+
+// identifierName returns the name an identifier stands for: unquoted when
+// quoted, folded to lower case otherwise, as PostgreSQL does.
+func identifierName(ident string) string {
+	if len(ident) >= 2 && ident[0] == '"' {
+		return strings.ReplaceAll(ident[1:len(ident)-1], `""`, `"`)
+	}
+	return strings.ToLower(ident)
 }
 
 // unqualifiedTablePattern matches a quoted identifier that directly follows a

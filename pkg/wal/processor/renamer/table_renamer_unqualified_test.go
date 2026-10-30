@@ -291,3 +291,136 @@ func TestRegressionCases(t *testing.T) {
 		})
 	}
 }
+
+// TestRenameInSQL_AlterTableRenameTo covers ALTER TABLE ... RENAME TO: the new
+// name is a table name and takes the rule, while the other RENAME ... TO and
+// ... TO forms name objects the renamer leaves alone.
+func TestRenameInSQL_AlterTableRenameTo(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewTableRenamer(&Config{Rules: []Rule{
+		{Schema: "public", Match: "^(.*)$", Replace: "piana_$1"},
+	}})
+	if err != nil {
+		t.Fatalf("build renamer: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "unqualified table",
+			in:   `ALTER TABLE "PreCardPaymentMetadata" RENAME TO "CardPrePaymentMetadata";`,
+			want: `ALTER TABLE "piana_PreCardPaymentMetadata" RENAME TO "piana_CardPrePaymentMetadata";`,
+		},
+		{
+			name: "lower case keywords",
+			in:   `alter table "A" rename to "B";`,
+			want: `alter table "piana_A" rename to "piana_B";`,
+		},
+		{
+			name: "IF EXISTS and ONLY",
+			in:   `ALTER TABLE IF EXISTS ONLY "A" RENAME TO "B";`,
+			want: `ALTER TABLE IF EXISTS ONLY "piana_A" RENAME TO "piana_B";`,
+		},
+		{
+			name: "qualified table in the rule schema",
+			in:   `ALTER TABLE "public"."A" RENAME TO "B";`,
+			want: `ALTER TABLE "public"."piana_A" RENAME TO "piana_B";`,
+		},
+		{
+			name: "unquoted qualified table in the rule schema",
+			in:   `ALTER TABLE public.a RENAME TO b;`,
+			want: `ALTER TABLE public.piana_a RENAME TO "piana_b";`,
+		},
+		{
+			name: "qualified table in another schema",
+			in:   `ALTER TABLE "other"."A" RENAME TO "B";`,
+			want: `ALTER TABLE "other"."A" RENAME TO "B";`,
+		},
+		{
+			name: "unquoted new name is folded to lower case",
+			in:   `ALTER TABLE "A" RENAME TO NewName;`,
+			want: `ALTER TABLE "piana_A" RENAME TO "piana_newname";`,
+		},
+		{
+			name: "RENAME COLUMN",
+			in:   `ALTER TABLE "A" RENAME COLUMN "x" TO "y";`,
+			want: `ALTER TABLE "piana_A" RENAME COLUMN "x" TO "y";`,
+		},
+		{
+			name: "RENAME without COLUMN renames a column",
+			in:   `ALTER TABLE "A" RENAME "x" TO "y";`,
+			want: `ALTER TABLE "piana_A" RENAME "x" TO "y";`,
+		},
+		{
+			name: "RENAME CONSTRAINT",
+			in:   `ALTER TABLE "A" RENAME CONSTRAINT "A_pkey" TO "B_pkey";`,
+			want: `ALTER TABLE "piana_A" RENAME CONSTRAINT "A_pkey" TO "B_pkey";`,
+		},
+		{
+			name: "OWNER TO",
+			in:   `ALTER TABLE "A" OWNER TO "admin";`,
+			want: `ALTER TABLE "piana_A" OWNER TO "admin";`,
+		},
+		{
+			name: "ALTER INDEX, SEQUENCE and TYPE RENAME TO",
+			in: `ALTER INDEX "A_idx" RENAME TO "B_idx";
+ALTER SEQUENCE "A_id_seq" RENAME TO "B_id_seq";
+ALTER TYPE "AType" RENAME TO "BType";`,
+			want: `ALTER INDEX "A_idx" RENAME TO "B_idx";
+ALTER SEQUENCE "A_id_seq" RENAME TO "B_id_seq";
+ALTER TYPE "AType" RENAME TO "BType";`,
+		},
+		{
+			name: "in a comment",
+			in: `-- ALTER TABLE "A" RENAME TO "B"
+SELECT 1;`,
+			want: `-- ALTER TABLE "A" RENAME TO "B"
+SELECT 1;`,
+		},
+		{
+			name: "Prisma rename migration",
+			in: `-- RenameEnum
+ALTER TYPE "PreCardPaymentMetadataType" RENAME TO "CardPrePaymentMetadataType";
+
+-- RenameTable
+ALTER TABLE "PreCardPaymentMetadata" RENAME TO "CardPrePaymentMetadata";
+
+-- RenameConstraints
+ALTER TABLE "CardPrePaymentMetadata" RENAME CONSTRAINT "PreCardPaymentMetadata_pkey" TO "CardPrePaymentMetadata_pkey";
+
+-- RenameIndexes
+ALTER INDEX "PreCardPaymentMetadata_paymentId_key" RENAME TO "CardPrePaymentMetadata_paymentId_key";
+
+-- Rename columns in CompanySetting
+ALTER TABLE "CompanySetting" RENAME COLUMN "prePaymentRequirement" TO "cardPrePaymentRequirement";`,
+			want: `-- RenameEnum
+ALTER TYPE "PreCardPaymentMetadataType" RENAME TO "CardPrePaymentMetadataType";
+
+-- RenameTable
+ALTER TABLE "piana_PreCardPaymentMetadata" RENAME TO "piana_CardPrePaymentMetadata";
+
+-- RenameConstraints
+ALTER TABLE "piana_CardPrePaymentMetadata" RENAME CONSTRAINT "PreCardPaymentMetadata_pkey" TO "CardPrePaymentMetadata_pkey";
+
+-- RenameIndexes
+ALTER INDEX "PreCardPaymentMetadata_paymentId_key" RENAME TO "CardPrePaymentMetadata_paymentId_key";
+
+-- Rename columns in CompanySetting
+ALTER TABLE "piana_CompanySetting" RENAME COLUMN "prePaymentRequirement" TO "cardPrePaymentRequirement";`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := string(r.RenameInSQL([]byte(tt.in)))
+			if got != tt.want {
+				t.Errorf("RenameInSQL()\n got:  %s\n want: %s", got, tt.want)
+			}
+		})
+	}
+}
