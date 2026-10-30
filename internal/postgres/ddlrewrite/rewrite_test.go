@@ -600,3 +600,87 @@ func TestRewriteDDL_LeadingCommentSingleStatement(t *testing.T) {
 	require.True(t, skip, "a commented CREATE TYPE is still a CREATE TYPE")
 	require.Empty(t, sql)
 }
+
+// An enum renamed by ALTER TYPE ... RENAME TO is converted by its new name in
+// the DDL that follows, and the rename is not replayed on the target, which has
+// no enum types: whether the tracker followed the rename from the stream or
+// was bootstrapped from the renamed catalog after a restart.
+func TestRewriteDDL_RenamedEnum(t *testing.T) {
+	t.Parallel()
+
+	const rename = `ALTER TYPE "PreCardPaymentMetadataType" RENAME TO "CardPrePaymentMetadataType";`
+	const addColumn = `ALTER TABLE "CardPrePaymentMetadata" ADD COLUMN "kind" "CardPrePaymentMetadataType" NOT NULL DEFAULT 'a'::public."CardPrePaymentMetadataType";`
+
+	tests := []struct {
+		name    string
+		tracker *EnumTypeTracker
+	}{
+		{name: "followed from the stream", tracker: trackerWith("public.PreCardPaymentMetadataType")},
+		{name: "bootstrapped after the rename", tracker: trackerWith("public.CardPrePaymentMetadataType")},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			UpdateTrackerFromEnumDDL(tc.tracker, "ALTER TYPE", "-- RenameEnum\n"+rename)
+
+			sql, skip := RewriteDDL(rename, "ALTER TYPE", true, tc.tracker, nil)
+			require.True(t, skip)
+			require.Empty(t, sql)
+
+			sql, skip = RewriteDDL(addColumn, "ALTER TABLE", true, tc.tracker, nil)
+			require.False(t, skip)
+			require.Equal(t, `ALTER TABLE "CardPrePaymentMetadata" ADD COLUMN "kind" text NOT NULL DEFAULT 'a'::text;`, sql)
+
+			require.False(t, tc.tracker.IsEnum(`"PreCardPaymentMetadataType"`))
+			require.False(t, tc.tracker.IsEnum("public.PreCardPaymentMetadataType"))
+		})
+	}
+}
+
+func TestRewriteDDL_RenamedNonEnumTypeNotSkipped(t *testing.T) {
+	t.Parallel()
+
+	tracker := trackerWith("public.Status")
+	const ddl = `ALTER TYPE "Pair" RENAME TO "Couple";`
+
+	UpdateTrackerFromEnumDDL(tracker, "ALTER TYPE", ddl)
+	sql, skip := RewriteDDL(ddl, "ALTER TYPE", true, tracker, nil)
+
+	require.False(t, skip)
+	require.Equal(t, ddl, sql)
+	require.False(t, tracker.IsEnum(`"Couple"`))
+	require.True(t, tracker.IsEnum(`"Status"`))
+}
+
+func TestEnumTypeTracker_Rename(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		tracked string
+		oldName string
+	}{
+		{name: "bootstrapped, unqualified rename", tracked: "public.Old", oldName: `"Old"`},
+		{name: "bootstrapped, qualified rename", tracked: "public.Old", oldName: `public."Old"`},
+		{name: "created in the stream", tracked: `"Old"`, oldName: `"Old"`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tracker := trackerWith(tc.tracked, "public.Other")
+			tracker.Rename(tc.oldName, `"New"`)
+
+			for _, name := range []string{"Old", `"Old"`, "public.Old", `public."Old"`} {
+				require.False(t, tracker.IsEnum(name), name)
+			}
+			for _, name := range []string{"New", `"New"`, `public."New"`} {
+				require.True(t, tracker.IsEnum(name), name)
+			}
+			require.True(t, tracker.IsEnum("public.Other"))
+		})
+	}
+}

@@ -79,6 +79,30 @@ func (et *EnumTypeTracker) Remove(typeName string) {
 	et.sortedPatterns = nil
 }
 
+// Rename follows ALTER TYPE ... RENAME TO: every variant the type is tracked
+// under, qualified or not, moves to the new name, which lives in the schema of
+// the old one. The tracker ends up as a bootstrap from the renamed catalog
+// would leave it.
+func (et *EnumTypeTracker) Rename(oldName, newName string) {
+	oldSchema, oldType := parseSchemaAndType(oldName)
+	_, newType := parseSchemaAndType(newName)
+
+	renamed := []string{newType}
+	for name := range et.types {
+		schema, typeOnly := parseSchemaAndType(name)
+		if typeOnly != oldType || (oldSchema != "" && schema != "" && schema != oldSchema) {
+			continue
+		}
+		delete(et.types, name)
+		if schema != "" {
+			renamed = append(renamed, schema+"."+newType)
+		}
+	}
+	for _, name := range renamed {
+		et.Add(name)
+	}
+}
+
 func (et *EnumTypeTracker) IsEnum(typeName string) bool {
 	return pglib.IsEnumType(typeName, et.types)
 }
@@ -166,6 +190,8 @@ var (
 	// Regular expressions for parsing SQL statements
 	createTypeRegex = regexp.MustCompile(`(?i)^CREATE\s+TYPE\s+([^\s]+)\s+AS\s+ENUM`)
 	alterTypeRegex  = regexp.MustCompile(`(?i)^ALTER\s+TYPE\s+([^\s]+)`)
+	// alterTypeRenameRegex captures the old and the new name of a type rename
+	alterTypeRenameRegex = regexp.MustCompile(`(?i)^ALTER\s+TYPE\s+([^\s]+)\s+RENAME\s+TO\s+([^\s;]+)`)
 )
 
 // parseSchemaAndType parses a PostgreSQL qualified type name into schema and type parts.
@@ -361,10 +387,17 @@ func ConvertEnumTypeInAlterColumn(alterSQL string, tracker *EnumTypeTracker) str
 	return result
 }
 
-// IsAlterTypeForEnum checks if an ALTER TYPE statement is for an ENUM type
+// IsAlterTypeForEnum checks if an ALTER TYPE statement is for an ENUM type. A
+// rename is when either name is tracked: the tracker may already know the type
+// by its new name, having followed the rename from the whole captured query or
+// been bootstrapped from the source catalog after it.
 func IsAlterTypeForEnum(line string, tracker *EnumTypeTracker) bool {
 	if tracker == nil {
 		return false
+	}
+
+	if matches := alterTypeRenameRegex.FindStringSubmatch(line); len(matches) > 2 && tracker.IsEnum(matches[2]) {
+		return true
 	}
 
 	// Extract type name from ALTER TYPE statement

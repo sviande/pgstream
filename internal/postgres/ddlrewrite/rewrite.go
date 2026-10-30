@@ -188,8 +188,9 @@ func rewriteStatement(ddl, commandTag string, convertEnums bool, tracker *EnumTy
 
 // UpdateTrackerFromEnumDDL keeps the enum tracker in sync with CREATE/ALTER/DROP
 // TYPE DDL flowing through the replication stream: it registers newly created
-// enums (and enums gaining/renaming values), and unregisters dropped enums.
-// Non-type DDL is ignored. Callers are responsible for synchronisation.
+// enums (and enums gaining/renaming values), follows renamed enums, and
+// unregisters dropped enums. Non-type DDL is ignored. Callers are responsible
+// for synchronisation.
 func UpdateTrackerFromEnumDDL(tracker *EnumTypeTracker, commandTag, ddl string) {
 	if tracker == nil {
 		return
@@ -213,6 +214,9 @@ func UpdateTrackerFromEnumDDL(tracker *EnumTypeTracker, commandTag, ddl string) 
 			if m := alterTypeRegex.FindStringSubmatch(firstLine); len(m) > 1 {
 				tracker.Add(m[1])
 			}
+		} else if m := alterTypeRenameRegex.FindStringSubmatch(firstLine); len(m) > 2 && tracker.IsEnum(m[1]) {
+			// the DDL that follows names the enum by its new name, to convert as well
+			tracker.Rename(m[1], m[2])
 		}
 	case strings.HasPrefix(tag, "DROP TYPE"):
 		if m := dropTypeRegex.FindStringSubmatch(firstLine); len(m) > 1 {
