@@ -101,6 +101,13 @@ func TestStatementTag(t *testing.T) {
 		{stmt: `DROP TYPE "P";`, want: "DROP TYPE"},
 		{stmt: `UPDATE "t" SET "c" = 1;`, want: "UPDATE"},
 		{stmt: `CREATE TABLE("t");`, want: "CREATE TABLE"},
+		{stmt: `CREATE OR REPLACE FUNCTION "f"() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;`, want: "CREATE FUNCTION"},
+		{stmt: `CREATE OR REPLACE TRIGGER "t" AFTER INSERT ON "x" FOR EACH ROW EXECUTE FUNCTION "f"();`, want: "CREATE TRIGGER"},
+		{stmt: `CREATE CONSTRAINT TRIGGER "t" AFTER INSERT ON "x" FOR EACH ROW EXECUTE FUNCTION "f"();`, want: "CREATE TRIGGER"},
+		{stmt: `CREATE UNIQUE INDEX "i" ON "x"("c");`, want: "CREATE INDEX"},
+		{stmt: `CREATE TEMP TABLE "x" ("c" text);`, want: "CREATE TABLE"},
+		{stmt: "BEGIN;", want: "BEGIN"},
+		{stmt: "-- lock first\nLOCK TABLE \"x\" IN SHARE ROW EXCLUSIVE MODE;", want: "LOCK"},
 	}
 
 	for _, tc := range tests {

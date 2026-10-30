@@ -5,10 +5,11 @@ package postgres
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"github.com/xataio/pgstream/internal/postgres/ddlrewrite"
 )
 
-func TestPGSchemaObserver_RewriteDDL_ExcludeTriggers(t *testing.T) {
+func TestPGSchemaObserver_RewriteDDLStatements_ExcludeTriggers(t *testing.T) {
 	t.Parallel()
 
 	// Verbatim trigger from logs.txt:622 that failed on the target with
@@ -68,10 +69,48 @@ FOR EACH ROW EXECUTE FUNCTION delete_swan_user_reference_on_user_disable();`
 				excludeTriggers: tc.excludeTriggers,
 				enumTracker:     ddlrewrite.NewEnumTypeTracker(),
 			}
-			sql, skip := o.RewriteDDL(tc.ddl, tc.commandTag)
-			if skip != tc.wantSkip {
-				t.Fatalf("RewriteDDL skip = %v, want %v (sql=%q)", skip, tc.wantSkip, sql)
+			statements := o.RewriteDDLStatements(tc.ddl, tc.commandTag)
+			if skip := len(statements) == 0; skip != tc.wantSkip {
+				t.Fatalf("RewriteDDLStatements skip = %v, want %v (statements=%q)", skip, tc.wantSkip, statements)
 			}
 		})
+	}
+}
+
+// A trigger bundled with other DDL in one payload is dropped on its own: the
+// function it calls is still replayed, whichever event carries the payload.
+func TestPGSchemaObserver_RewriteDDLStatements_ExcludeTriggersInPayload(t *testing.T) {
+	t.Parallel()
+
+	const function = `CREATE OR REPLACE FUNCTION "insert_setting_history"() RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO "SettingHistory" ("id", "settingId") VALUES (gen_random_uuid(), NEW."id");
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;`
+	const trigger = `CREATE TRIGGER "setting_history_on_insert" AFTER INSERT ON "Setting" FOR EACH ROW EXECUTE FUNCTION "insert_setting_history"();`
+	const constraintTrigger = `CREATE CONSTRAINT TRIGGER "setting_check" AFTER INSERT ON "Setting" FOR EACH ROW EXECUTE FUNCTION "insert_setting_history"();`
+	payload := "BEGIN;\nLOCK TABLE \"Setting\" IN SHARE ROW EXCLUSIVE MODE;\n" + function + "\n" + trigger + "\n" + constraintTrigger + "\nCOMMIT;"
+
+	tests := []struct {
+		name            string
+		excludeTriggers bool
+		want            []string
+	}{
+		{name: "exclude on", excludeTriggers: true, want: []string{function}},
+		{name: "exclude off", excludeTriggers: false, want: []string{function, trigger, constraintTrigger}},
+	}
+
+	for _, tc := range tests {
+		for _, commandTag := range []string{"CREATE FUNCTION", "CREATE TRIGGER"} {
+			t.Run(tc.name+"/"+commandTag, func(t *testing.T) {
+				t.Parallel()
+				o := &pgSchemaObserver{
+					excludeTriggers: tc.excludeTriggers,
+					enumTracker:     ddlrewrite.NewEnumTypeTracker(),
+				}
+				require.Equal(t, tc.want, o.RewriteDDLStatements(payload, commandTag))
+			})
+		}
 	}
 }

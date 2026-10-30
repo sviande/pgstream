@@ -134,38 +134,29 @@ func (o *pgSchemaObserver) isEnumType(colType string) bool {
 	return o.enumTracker.IsEnum(colType)
 }
 
-// RewriteDDL rewrites a raw replicated DDL statement for the target (ENUM->TEXT
-// + table renaming), returning skip=true when it must not be applied. It is
-// safe for concurrent use.
-func (o *pgSchemaObserver) RewriteDDL(ddl, commandTag string) (string, bool) {
-	// Triggers are dropped here (not just at snapshot time) so the target never
-	// gets a trigger that references the source-side schema/table names.
-	// Note: emit_ddl captures current_query(), so a trigger created in the same
-	// statement as other DDL (e.g. CREATE FUNCTION; CREATE TRIGGER) shares that
-	// text; this skips events whose command tag is the trigger op.
-	if o.excludeTriggers && isTriggerCommandTag(commandTag) {
-		return "", true
-	}
-
-	o.enumMu.Lock()
-	defer o.enumMu.Unlock()
-	var tr ddlrewrite.TableRenamer
-	if o.tableRenamer != nil {
-		tr = o.tableRenamer
-	}
-	return ddlrewrite.RewriteDDL(ddl, commandTag, o.convertEnumsToText, o.enumTracker, tr)
-}
-
 // RewriteDDLStatements rewrites a raw replicated DDL payload for the target and
 // returns one entry per statement to replay. It is safe for concurrent use.
 func (o *pgSchemaObserver) RewriteDDLStatements(ddl, commandTag string) []string {
 	o.enumMu.Lock()
-	defer o.enumMu.Unlock()
 	var tr ddlrewrite.TableRenamer
 	if o.tableRenamer != nil {
 		tr = o.tableRenamer
 	}
-	return ddlrewrite.RewriteDDLStatements(ddl, commandTag, o.convertEnumsToText, o.enumTracker, tr)
+	statements := ddlrewrite.RewriteDDLStatements(ddl, commandTag, o.convertEnumsToText, o.enumTracker, tr)
+	o.enumMu.Unlock()
+
+	sqls := make([]string, 0, len(statements))
+	for _, stmt := range statements {
+		// Triggers are dropped here (not just at snapshot time) so the target
+		// never gets a trigger that references the source-side schema/table
+		// names. The check runs per statement, so a payload bundling a trigger
+		// with the function it calls only loses the trigger.
+		if o.excludeTriggers && isTriggerCommandTag(stmt.Tag) {
+			continue
+		}
+		sqls = append(sqls, stmt.SQL)
+	}
+	return sqls
 }
 
 // isTriggerCommandTag reports whether the DDL command tag is a trigger

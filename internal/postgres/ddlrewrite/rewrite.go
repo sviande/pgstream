@@ -47,18 +47,58 @@ func RewriteDDL(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTrac
 	if len(statements) == 0 {
 		return "", true
 	}
-	return strings.Join(statements, "\n"), false
+	sqls := make([]string, 0, len(statements))
+	for _, stmt := range statements {
+		sqls = append(sqls, stmt.SQL)
+	}
+	return strings.Join(sqls, "\n"), false
+}
+
+// Statement is one statement of a captured DDL payload, rewritten for the
+// target.
+type Statement struct {
+	SQL string
+	// Tag is the command tag of the statement: the event trigger's own tag for
+	// a lone statement, derived from its leading keywords otherwise.
+	Tag string
+}
+
+// nonDDLStatements lists the command tags of the statements a captured payload
+// may carry around its DDL but that must never be replayed on the target:
+//   - transaction control: each statement runs on its own on the target, so
+//     BEGIN/COMMIT mean nothing there and LOCK fails outright (25P01, "LOCK
+//     TABLE can only be used in transaction blocks");
+//   - session state: SET/RESET/DISCARD would leak into the writer's pooled
+//     connection;
+//   - data changes: the rows a backfill writes reach the target through the WAL
+//     like any other change, so replaying the statement would apply them twice
+//     (duplicate rows for an INSERT ... SELECT). SELECT ... INTO, which creates
+//     a table, is dropped along with the other queries: migration tools do not
+//     emit it.
+//
+// DO and CALL are not listed: the code they run may hold DDL as well as DML, so
+// they are replayed and left to the caller to report.
+var nonDDLStatements = map[string]struct{}{
+	"BEGIN": {}, "START": {}, "COMMIT": {}, "END": {}, "ROLLBACK": {}, "ABORT": {},
+	"SAVEPOINT": {}, "RELEASE": {}, "PREPARE": {},
+	"LOCK": {}, "SET": {}, "RESET": {}, "DISCARD": {},
+	"INSERT": {}, "UPDATE": {}, "DELETE": {}, "MERGE": {}, "COPY": {}, "TRUNCATE": {},
+	"SELECT": {}, "WITH": {}, "VALUES": {}, "TABLE": {},
 }
 
 // RewriteDDLStatements rewrites the captured DDL and returns the statements to
 // replay, one entry per statement, in order. It returns an empty slice when
 // nothing must be applied on the target.
 //
+// Statements of a multi-statement payload that are not DDL (see
+// nonDDLStatements) are dropped. A lone statement is always kept: the event
+// trigger fired for it, so it is DDL whatever its leading keyword.
+//
 // Callers should execute the statements one by one rather than as a single
 // query: a statement that fails on the target (typically an "already exists"
 // when a DDL is replayed after a restart) then no longer takes the rest of the
 // migration down with it.
-func RewriteDDLStatements(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTracker, renamer TableRenamer) []string {
+func RewriteDDLStatements(ddl, commandTag string, convertEnums bool, tracker *EnumTypeTracker, renamer TableRenamer) []Statement {
 	statements := SplitStatements(ddl)
 	if len(statements) == 0 {
 		return nil
@@ -69,11 +109,14 @@ func RewriteDDLStatements(ddl, commandTag string, convertEnums bool, tracker *En
 		statements[0] = ddl
 	}
 
-	kept := make([]string, 0, len(statements))
+	kept := make([]Statement, 0, len(statements))
 	for _, stmt := range statements {
 		tag := commandTag
 		if len(statements) > 1 {
 			tag = StatementTag(stmt)
+			if _, ok := nonDDLStatements[tag]; ok {
+				continue
+			}
 		}
 		stmtSQL, stmtSkip := rewriteStatement(stmt, tag, convertEnums, tracker)
 		if stmtSkip {
@@ -82,7 +125,7 @@ func RewriteDDLStatements(ddl, commandTag string, convertEnums bool, tracker *En
 		if renamer != nil && renamer.HasRules() {
 			stmtSQL = string(renamer.RenameInSQL([]byte(stmtSQL)))
 		}
-		kept = append(kept, stmtSQL)
+		kept = append(kept, Statement{SQL: stmtSQL, Tag: tag})
 	}
 	return kept
 }

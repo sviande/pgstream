@@ -176,12 +176,22 @@ func dollarQuoteTag(runes []rune, i int) string {
 	return ""
 }
 
+// createModifiers are the keywords that may sit between CREATE and the object
+// type. Postgres leaves them out of the command tag: CREATE OR REPLACE FUNCTION
+// is tagged CREATE FUNCTION, CREATE CONSTRAINT TRIGGER is tagged CREATE
+// TRIGGER, CREATE UNIQUE INDEX is tagged CREATE INDEX.
+var createModifiers = map[string]struct{}{
+	"OR": {}, "REPLACE": {}, "CONSTRAINT": {}, "UNIQUE": {}, "TEMP": {}, "TEMPORARY": {}, "UNLOGGED": {},
+	"RECURSIVE": {}, "TRUSTED": {}, "PROCEDURAL": {}, "DEFAULT": {},
+}
+
 // StatementTag derives the command tag of a single statement, skipping any
-// leading comments. It is a best-effort match on the leading keywords: only the
-// type-related tags drive rewriting decisions, everything else falls through to
-// the generic conversion path.
+// leading comments. It is a best-effort match on the leading keywords: the
+// type-related tags drive enum rewriting, the trigger tags drive trigger
+// exclusion and the leading keyword of the rest tells DDL from the transaction
+// control and data statements bundled with it.
 func StatementTag(stmt string) string {
-	words := leadingWords(stmt, 2)
+	words := commandWords(stmt, 2)
 	if len(words) == 0 {
 		return ""
 	}
@@ -192,6 +202,26 @@ func StatementTag(stmt string) string {
 		}
 	}
 	return words[0]
+}
+
+// commandWords returns up to n leading keywords of a statement as they appear
+// in its command tag: uppercased, with the modifiers following CREATE left out.
+func commandWords(stmt string, n int) []string {
+	words := leadingWords(stmt, n+len(createModifiers))
+	if len(words) > 1 && words[0] == "CREATE" {
+		rest := words[1:]
+		for len(rest) > 1 {
+			if _, ok := createModifiers[rest[0]]; !ok {
+				break
+			}
+			rest = rest[1:]
+		}
+		words = append(words[:1], rest...)
+	}
+	if len(words) > n {
+		words = words[:n]
+	}
+	return words
 }
 
 // leadingWords returns up to n leading uppercase words of a statement, skipping

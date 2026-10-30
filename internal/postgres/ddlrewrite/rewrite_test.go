@@ -324,9 +324,10 @@ func TestUpdateTrackerFromEnumDDL(t *testing.T) {
 
 // TestRewriteDDL_MultiStatementBackfillRename exercises the full RewriteDDL ->
 // renamer.RenameInSQL path with the production rule on an "ALTER + backfill"
-// block captured whole by current_query(). The UPDATE/FROM tables must be
-// renamed (else the backfill fails with "relation does not exist" and rolls back
-// the ADD COLUMN), while columns, aliases and alias-qualified refs stay intact.
+// block captured whole by current_query(). The ALTER statements are renamed
+// while the backfill UPDATE is dropped: the rows it writes reach the target
+// through the WAL, and a SET NOT NULL replayed before them fails harmlessly
+// then succeeds when the event of that statement is replayed, after them.
 func TestRewriteDDL_MultiStatementBackfillRename(t *testing.T) {
 	r, err := renamer.NewTableRenamer(&renamer.Config{Rules: []renamer.Rule{
 		{Schema: "public", Match: "^(.*)$", Replace: "piana_$1"},
@@ -343,10 +344,6 @@ WHERE "order"."companyId" = "company"."id";
 ALTER TABLE "EvPassOrder" ALTER COLUMN "companyName" SET NOT NULL;`
 
 	want := `ALTER TABLE "piana_EvPassOrder" ADD COLUMN "companyName" TEXT;
-UPDATE "piana_EvPassOrder" AS "order"
-SET "companyName" = "company"."name"
-FROM "piana_Company" AS "company"
-WHERE "order"."companyId" = "company"."id";
 ALTER TABLE "piana_EvPassOrder" ALTER COLUMN "companyName" SET NOT NULL;`
 
 	got, skip := RewriteDDL(ddl, "ALTER TABLE", false, nil, r)
@@ -356,6 +353,144 @@ ALTER TABLE "piana_EvPassOrder" ALTER COLUMN "companyName" SET NOT NULL;`
 	if got != want {
 		t.Errorf("RewriteDDL mismatch:\n got:  %s\n want: %s", got, want)
 	}
+}
+
+// migrationTransactionBlock has the shape of the Prisma migration that stopped
+// the replication on 2026-10-27: a block sent as one query, opened by BEGIN and
+// a LOCK, holding a trigger function, its triggers and an INSERT ... SELECT
+// backfill. The function body holds BEGIN, INSERT and END IF of its own, which
+// must stay inside the CREATE FUNCTION statement.
+const migrationTransactionBlock = `BEGIN;
+
+-- No row may change between the backfill below and the triggers taking over.
+LOCK TABLE "Setting" IN SHARE ROW EXCLUSIVE MODE;
+
+-- Every write path leaves a trace.
+CREATE OR REPLACE FUNCTION "insert_setting_history"()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO "SettingHistory" ("id", "settingId", "enabled", "createdAt")
+    VALUES (gen_random_uuid(), NEW."id", NEW."enabled", NEW."createdAt");
+  ELSIF NEW."enabled" IS DISTINCT FROM OLD."enabled" THEN
+    -- clock_timestamp(); so a change in the creating transaction sorts after it.
+    INSERT INTO "SettingHistory" ("id", "settingId", "enabled", "createdAt")
+    VALUES (gen_random_uuid(), NEW."id", NEW."enabled", clock_timestamp() AT TIME ZONE 'UTC');
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER "setting_history_on_insert"
+AFTER INSERT ON "Setting"
+FOR EACH ROW
+EXECUTE FUNCTION "insert_setting_history"();
+
+CREATE TRIGGER "setting_history_on_update"
+AFTER UPDATE OF "enabled" ON "Setting"
+FOR EACH ROW
+EXECUTE FUNCTION "insert_setting_history"();
+
+-- Existing settings start with their current value.
+INSERT INTO "SettingHistory" ("id", "settingId", "enabled", "createdAt")
+SELECT gen_random_uuid(), "Setting"."id", "Setting"."enabled", LEAST("Setting"."createdAt", "Company"."createdAt")
+FROM "Setting"
+JOIN "Company" ON "Company"."id" = "Setting"."companyId";
+
+COMMIT;`
+
+// Replaying the block statement by statement ran LOCK outside a transaction
+// (25P01, fatal for the writer) and would have replayed the backfill, which
+// already reaches the target through the WAL. Only the DDL survives, with the
+// function body intact.
+func TestRewriteDDLStatements_MigrationTransactionBlock(t *testing.T) {
+	t.Parallel()
+
+	// every event fired by the block carries it whole, whatever its own tag
+	for _, commandTag := range []string{"CREATE FUNCTION", "CREATE TRIGGER"} {
+		t.Run(commandTag, func(t *testing.T) {
+			t.Parallel()
+
+			statements := RewriteDDLStatements(migrationTransactionBlock, commandTag, false, nil, nil)
+
+			tags := make([]string, 0, len(statements))
+			for _, stmt := range statements {
+				tags = append(tags, stmt.Tag)
+			}
+			require.Equal(t, []string{"CREATE FUNCTION", "CREATE TRIGGER", "CREATE TRIGGER"}, tags)
+
+			function := statements[0].SQL
+			require.True(t, strings.HasPrefix(function, "-- Every write path leaves a trace.\nCREATE OR REPLACE FUNCTION"), function)
+			require.True(t, strings.HasSuffix(function, "$$ LANGUAGE plpgsql;"), function)
+			require.Equal(t, 2, strings.Count(function, `INSERT INTO "SettingHistory"`), "the function body must stay whole")
+		})
+	}
+}
+
+// Transaction control, session state and data statements bundled with DDL are
+// dropped; DDL and procedural code are kept.
+func TestRewriteDDLStatements_DropsNonDDL(t *testing.T) {
+	t.Parallel()
+
+	const createTable = `CREATE TABLE "t" ("id" text PRIMARY KEY);`
+
+	tests := []struct {
+		name    string
+		stmt    string
+		wantTag string // empty when the statement must be dropped
+	}{
+		{name: "BEGIN", stmt: "BEGIN;"},
+		{name: "START TRANSACTION", stmt: "START TRANSACTION ISOLATION LEVEL SERIALIZABLE;"},
+		{name: "COMMIT", stmt: "COMMIT;"},
+		{name: "END", stmt: "END;"},
+		{name: "ROLLBACK", stmt: "ROLLBACK;"},
+		{name: "SAVEPOINT", stmt: "SAVEPOINT before_backfill;"},
+		{name: "RELEASE", stmt: "RELEASE SAVEPOINT before_backfill;"},
+		{name: "LOCK", stmt: `LOCK TABLE "t" IN ACCESS EXCLUSIVE MODE;`},
+		{name: "SET", stmt: "SET LOCAL lock_timeout = '5s';"},
+		{name: "RESET", stmt: "RESET lock_timeout;"},
+		{name: "INSERT", stmt: `INSERT INTO "t" ("id") VALUES ('a');`},
+		{name: "UPDATE", stmt: `UPDATE "t" SET "id" = 'b';`},
+		{name: "DELETE", stmt: `DELETE FROM "t";`},
+		{name: "MERGE", stmt: `MERGE INTO "t" USING "u" ON "t"."id" = "u"."id" WHEN NOT MATCHED THEN INSERT VALUES ("u"."id");`},
+		{name: "TRUNCATE", stmt: `TRUNCATE "t";`},
+		{name: "SELECT", stmt: `SELECT setval('"t_id_seq"', 1);`},
+		{name: "WITH", stmt: `WITH "moved" AS (DELETE FROM "t" RETURNING *) INSERT INTO "u" SELECT * FROM "moved";`},
+		{name: "ALTER TABLE", stmt: `ALTER TABLE "t" ADD COLUMN "c" text;`, wantTag: "ALTER TABLE"},
+		{name: "CREATE INDEX", stmt: `CREATE UNIQUE INDEX "t_c_key" ON "t"("c");`, wantTag: "CREATE INDEX"},
+		{name: "COMMENT", stmt: `COMMENT ON TABLE "t" IS 'x';`, wantTag: "COMMENT"},
+		{name: "DO", stmt: `DO $$ BEGIN ALTER TABLE "t" ADD COLUMN "d" text; END $$;`, wantTag: "DO"},
+		{name: "CALL", stmt: `CALL "migrate_t"();`, wantTag: "CALL"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			statements := RewriteDDLStatements(createTable+"\n"+tc.stmt, "CREATE TABLE", false, nil, nil)
+
+			require.Equal(t, createTable, statements[0].SQL)
+			if tc.wantTag == "" {
+				require.Len(t, statements, 1, "%q must be dropped", tc.stmt)
+				return
+			}
+			require.Len(t, statements, 2, "%q must be kept", tc.stmt)
+			require.Equal(t, tc.wantTag, statements[1].Tag)
+			require.Equal(t, tc.stmt, statements[1].SQL)
+		})
+	}
+}
+
+// A lone statement is DDL by definition, since the event trigger fired for it:
+// it is kept with the event's tag whatever its leading keyword.
+func TestRewriteDDLStatements_LoneStatementKept(t *testing.T) {
+	t.Parallel()
+
+	const ddl = `SELECT create_partition("events", '2026-11');`
+
+	statements := RewriteDDLStatements(ddl, "CREATE TABLE", false, nil, nil)
+
+	require.Equal(t, []Statement{{SQL: ddl, Tag: "CREATE TABLE"}}, statements)
 }
 
 func TestRewriteDDL_ConvertDisabledIsPassThrough(t *testing.T) {
