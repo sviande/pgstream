@@ -108,6 +108,42 @@ func TestHandlerRetrier_ReceiveMessage(t *testing.T) {
 			wantMsg: nil,
 			wantErr: resetConnErr,
 		},
+		{
+			name: "receive timeout is returned without retry",
+			handler: &mocks.Handler{
+				ReceiveMessageFn: func(_ context.Context, i uint64) (*replication.Message, error) {
+					require.Equal(t, uint64(1), i)
+					return nil, replication.ErrConnTimeout
+				},
+				ResetConnectionFn: func(ctx context.Context) error {
+					t.Error("unexpected call to ResetConnection")
+					return nil
+				},
+			},
+			boProvider: newMockBackoffProvider(),
+
+			wantMsg: nil,
+			wantErr: replication.ErrConnTimeout,
+		},
+		{
+			name: "retriable error then receive timeout",
+			handler: &mocks.Handler{
+				ReceiveMessageFn: func(_ context.Context, i uint64) (*replication.Message, error) {
+					require.Contains(t, []uint64{1, 2}, i)
+					if i == 1 {
+						return nil, retriableErr
+					}
+					return nil, replication.ErrConnTimeout
+				},
+				ResetConnectionFn: func(ctx context.Context) error {
+					return nil
+				},
+			},
+			boProvider: newMockBackoffProvider(),
+
+			wantMsg: nil,
+			wantErr: replication.ErrConnTimeout,
+		},
 	}
 
 	for _, tc := range tests {

@@ -454,6 +454,15 @@ func TestHandler_ReceiveMessage_RepliesToKeepalive(t *testing.T) {
 			wantErr:        errTest,
 			wantConnBroken: true,
 		},
+		{
+			// a timed out reply leaves the connection broken: it must not
+			// pass for an idle receive, which the retrier does not reset
+			name:    "error - sending reply times out",
+			sendErr: fmt.Errorf("%w: %w", pglib.ErrConnTimeout, errTest),
+
+			wantErr:        errTest,
+			wantConnBroken: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -482,6 +491,7 @@ func TestHandler_ReceiveMessage_RepliesToKeepalive(t *testing.T) {
 
 			msg, err := h.ReceiveMessage(context.Background())
 			require.ErrorIs(t, err, tc.wantErr)
+			require.NotErrorIs(t, err, replication.ErrConnTimeout)
 			require.Equal(t, tc.wantMessage, msg)
 			// the reply confirms what the writer synced, not the server WAL end
 			require.Equal(t, []uint64{testLSN}, sentLSNs)

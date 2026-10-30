@@ -61,13 +61,23 @@ func (h *HandlerRetrier) StartReplicationFromLSN(ctx context.Context, lsn replic
 func (h *HandlerRetrier) ReceiveMessage(ctx context.Context) (*replication.Message, error) {
 	var msg *replication.Message
 	var err error
+	var idle bool
 	op := func() error {
 		msg, err = h.inner.ReceiveMessage(ctx)
+		// The bounded receive expired on a healthy connection: nothing to
+		// retry, the listener receives again.
+		idle = errors.Is(err, replication.ErrConnTimeout)
+		if idle {
+			return nil
+		}
 		return err
 	}
 
 	if err := h.withRetry(ctx, op); err != nil {
 		return nil, err
+	}
+	if idle {
+		return nil, replication.ErrConnTimeout
 	}
 	return msg, nil
 }

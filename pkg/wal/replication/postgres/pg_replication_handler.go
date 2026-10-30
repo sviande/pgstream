@@ -274,17 +274,32 @@ func (h *Handler) ReceiveMessage(ctx context.Context) (*replication.Message, err
 	cancel()
 	// A receive deadline is expected and releases connMu so SyncLSN/Close are not
 	// starved; it does not mean the connection is broken.
-	if err != nil && !h.isExcludedTableError(err) && !errors.Is(err, pglib.ErrConnTimeout) {
+	idle := errors.Is(err, pglib.ErrConnTimeout)
+	if err != nil && !h.isExcludedTableError(err) && !idle {
 		h.connBroken = true
 	}
 	// Answer a keepalive at once rather than once the writer catches up with
 	// it: the source cuts the stream when the reply is late.
+	var replyErr error
 	if err == nil && pgMsg.ReplyRequested {
 		replyCtx, cancel := context.WithTimeout(ctx, timeout)
-		err = h.syncLSNLocked(replyCtx, h.lastSyncedLSN)
+		replyErr = h.syncLSNLocked(replyCtx, h.lastSyncedLSN)
 		cancel()
 	}
 	h.connMu.Unlock()
+
+	switch {
+	case idle:
+		// Nothing to receive before the deadline on an idle source: not an
+		// error, the listener just receives again.
+		h.logger.Trace("no message before the receive deadline")
+		return nil, replication.ErrConnTimeout
+	case replyErr != nil:
+		// Not mapped to ErrConnTimeout even when the send timed out: the
+		// connection is broken and has to be reset.
+		h.logger.Error(replyErr, "replying to keepalive")
+		return nil, replyErr
+	}
 
 	if err != nil {
 		switch {
@@ -497,11 +512,6 @@ func (h *Handler) mapPostgresError(err error) error {
 	}
 
 	h.logger.Error(err, "receiving message")
-
-	if errors.Is(err, pglib.ErrConnTimeout) {
-		return replication.ErrConnTimeout
-	}
-
 	return err
 }
 
