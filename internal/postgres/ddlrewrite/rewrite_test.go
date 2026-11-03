@@ -3,6 +3,7 @@
 package ddlrewrite
 
 import (
+	"math/rand"
 	"regexp"
 	"strings"
 	"testing"
@@ -682,5 +683,171 @@ func TestEnumTypeTracker_Rename(t *testing.T) {
 			}
 			require.True(t, tracker.IsEnum("public.Other"))
 		})
+	}
+}
+
+func TestEnumTypeTracker_Remove(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		tracker func() *EnumTypeTracker
+		dropped string
+	}{
+		{
+			name:    "bootstrapped, unqualified drop",
+			tracker: func() *EnumTypeTracker { return trackerWith("public.Old", "public.Other") },
+			dropped: `"Old"`,
+		},
+		{
+			name:    "bootstrapped, qualified drop",
+			tracker: func() *EnumTypeTracker { return trackerWith("public.Old", "public.Other") },
+			dropped: `"public"."Old"`,
+		},
+		{
+			name:    "created in the stream",
+			tracker: func() *EnumTypeTracker { return trackerWith(`"Old"`, "public.Other") },
+			dropped: `"Old"`,
+		},
+		{
+			name: "renamed from a bootstrapped enum",
+			tracker: func() *EnumTypeTracker {
+				tracker := trackerWith("public.Prev", "public.Other")
+				tracker.Rename(`"Prev"`, `"Old"`)
+				return tracker
+			},
+			dropped: `"Old"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tracker := tc.tracker()
+			tracker.Remove(tc.dropped)
+
+			for _, name := range []string{"Old", `"Old"`, "public.Old", `public."Old"`} {
+				require.False(t, tracker.IsEnum(name), name)
+			}
+			// no pattern is left that would turn the dropped name into text
+			require.Equal(t, `DROP TYPE "Old";`, ConvertEnumTypeInLine(`DROP TYPE "Old";`, tracker))
+			require.True(t, tracker.IsEnum("public.Other"))
+		})
+	}
+}
+
+// Prisma removes an enum value by swapping in a new type: create X_new, move
+// the columns to it, rename X to X_old and X_new to X, drop X_old. The CDC
+// adapter updates the tracker from each DDL event when the batch is built, then
+// again right before rewriting the event, so the replay below does the same,
+// with the event carrying either its own statement or the whole migration.
+func TestRewriteDDL_EnumValueRemoval(t *testing.T) {
+	t.Parallel()
+
+	const migration = `BEGIN;
+UPDATE "Role" SET "permissions" = array_remove("permissions", 'B') WHERE 'B' = ANY("permissions");
+CREATE TYPE "Permission_new" AS ENUM ('A');
+ALTER TABLE "Role" ALTER COLUMN "permissions" TYPE "Permission_new"[] USING ("permissions"::text[]::"Permission_new"[]);
+ALTER TYPE "Permission" RENAME TO "Permission_old";
+ALTER TYPE "Permission_new" RENAME TO "Permission";
+DROP TYPE "Permission_old";
+COMMIT;`
+
+	var events []string
+	for _, stmt := range SplitStatements(migration) {
+		if _, ok := nonDDLStatements[StatementTag(stmt)]; !ok {
+			events = append(events, stmt)
+		}
+	}
+	require.Len(t, events, 5)
+
+	for name, wholeQuery := range map[string]bool{"one statement per event": false, "whole migration per event": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			payload := func(stmt string) string {
+				if wholeQuery {
+					return migration
+				}
+				return stmt
+			}
+			tracker := trackerWith("public.Permission", "public.Other")
+			for _, stmt := range events {
+				UpdateTrackerFromEnumDDL(tracker, StatementTag(stmt), payload(stmt))
+			}
+			var replayed []string
+			for _, stmt := range events {
+				UpdateTrackerFromEnumDDL(tracker, StatementTag(stmt), payload(stmt))
+				for _, out := range RewriteDDLStatements(stmt, StatementTag(stmt), true, tracker, nil) {
+					replayed = append(replayed, strings.TrimSpace(out.SQL))
+				}
+			}
+
+			// The type statements are left out, except the DROP: by the time
+			// it is rewritten, the tracker no longer knows the dropped type,
+			// so it goes out unchanged and the target, which has no such type,
+			// rejects it with an error the writer tolerates. It must never
+			// become DROP TYPE text, which the target refuses with an error
+			// that stops the replication.
+			require.Len(t, replayed, 2)
+			require.True(t, strings.HasPrefix(replayed[0], `ALTER TABLE "Role"`), replayed[0])
+			require.Equal(t, `DROP TYPE "Permission_old";`, replayed[1])
+			require.True(t, tracker.IsEnum(`"Permission"`))
+			require.False(t, tracker.IsEnum(`"Permission_old"`))
+		})
+	}
+}
+
+// Whatever the sequence of creations, renames and drops, the converter never
+// turns into text a name that IsEnum rejects: a type statement that is not
+// skipped as enum DDL must not come out naming the type text.
+func TestEnumTypeTracker_ConverterAgreesWithIsEnum(t *testing.T) {
+	t.Parallel()
+
+	types := []string{"A", "B", "C"}
+	forms := func(typ string) []string {
+		return []string{typ, `"` + typ + `"`, "public." + typ, `public."` + typ + `"`, `"public"."` + typ + `"`}
+	}
+	rng := rand.New(rand.NewSource(1)) //nolint:gosec // a fixed seed keeps the sequences reproducible
+	anyForm := func() string {
+		f := forms(types[rng.Intn(len(types))])
+		return f[rng.Intn(len(f))]
+	}
+
+	for range 2000 {
+		tracker := NewEnumTypeTracker()
+		var ops []string
+		for range 8 {
+			// the operations UpdateTrackerFromEnumDDL applies
+			switch rng.Intn(3) {
+			case 0:
+				name := anyForm()
+				tracker.Add(name)
+				ops = append(ops, "add "+name)
+			case 1:
+				oldName, newName := anyForm(), `"`+types[rng.Intn(len(types))]+`"`
+				if tracker.IsEnum(oldName) {
+					tracker.Rename(oldName, newName)
+					ops = append(ops, "rename "+oldName+" to "+newName)
+				}
+			default:
+				name := anyForm()
+				if tracker.IsEnum(name) {
+					tracker.Remove(name)
+					ops = append(ops, "drop "+name)
+				}
+			}
+		}
+
+		for _, typ := range types {
+			for _, name := range forms(typ) {
+				if tracker.IsEnum(name) {
+					continue
+				}
+				stmt := "DROP TYPE " + name + ";"
+				require.Equal(t, stmt, ConvertEnumTypeInLine(stmt, tracker), "after %v", ops)
+			}
+		}
 	}
 }

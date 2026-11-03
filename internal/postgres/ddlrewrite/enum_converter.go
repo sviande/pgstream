@@ -48,15 +48,15 @@ func (et *EnumTypeTracker) Add(typeName string) {
 	// Add the original name
 	et.types[typeName] = true
 
-	// Also add cleaned variants
-	cleanName := strings.Trim(typeName, `"`)
-	et.types[cleanName] = true
-
-	// Add without schema prefix
-	if idx := strings.LastIndex(cleanName, "."); idx != -1 {
-		typeNameOnly := cleanName[idx+1:]
-		et.types[typeNameOnly] = true
-		et.types[`"`+typeNameOnly+`"`] = true
+	// Also add the unquoted variants, parsed as ComputeSortedPatterns parses
+	// them: trimming the outer quotes of public."Status" or "public"."Status"
+	// and cutting at the last dot left the bare type name out, so IsEnum
+	// rejected a name the converter kept turning into text.
+	schema, typeOnly := parseSchemaAndType(typeName)
+	et.types[typeOnly] = true
+	if schema != "" {
+		et.types[schema+"."+typeOnly] = true
+		et.types[`"`+typeOnly+`"`] = true
 	}
 
 	// new types invalidate the pre-computed patterns
@@ -64,16 +64,20 @@ func (et *EnumTypeTracker) Add(typeName string) {
 	et.sortedPatterns = nil
 }
 
-// Remove drops an ENUM type name (all variants) from the tracker.
+// Remove follows DROP TYPE: every variant the type is tracked under, qualified
+// or not, goes, with the same matching as Rename. An unqualified name must also
+// drop the schema-qualified variants that the bootstrap and Rename register:
+// ComputeSortedPatterns derives unqualified patterns from them, so a leftover
+// "public.X" kept converting X to text while IsEnum("X") reported false, and a
+// DROP TYPE "X" that was not skipped went out as DROP TYPE text.
 func (et *EnumTypeTracker) Remove(typeName string) {
-	cleanName := strings.Trim(typeName, `"`)
-	delete(et.types, typeName)
-	delete(et.types, cleanName)
-	delete(et.types, `"`+cleanName+`"`)
-	if idx := strings.LastIndex(cleanName, "."); idx != -1 {
-		typeNameOnly := cleanName[idx+1:]
-		delete(et.types, typeNameOnly)
-		delete(et.types, `"`+typeNameOnly+`"`)
+	schema, typeOnly := parseSchemaAndType(typeName)
+	for name := range et.types {
+		s, t := parseSchemaAndType(name)
+		if t != typeOnly || (schema != "" && s != "" && s != schema) {
+			continue
+		}
+		delete(et.types, name)
 	}
 	et.patternsComputed = false
 	et.sortedPatterns = nil
@@ -203,8 +207,9 @@ var (
 //   - "my-schema"."my-type" -> ("my-schema", "my-type")
 //   - status -> ("", "status")
 func parseSchemaAndType(qualifiedName string) (schema, typeName string) {
-	// Remove outer quotes if present
-	name := strings.Trim(qualifiedName, `"`)
+	// The quotes are kept for the scan: trimming the outer ones first turned
+	// "public"."Status" into public"."Status, whose dot then read as quoted.
+	name := qualifiedName
 
 	// Look for the separator dot, but not inside quotes
 	inQuotes := false
