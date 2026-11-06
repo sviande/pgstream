@@ -319,6 +319,23 @@ ALTER TABLE "Item_new" RENAME TO "Item";`
 			return ddlWalData(xid, lsn, addColumn, "ALTER TABLE", `public."Item"`)
 		}
 		procedural = `DO $$ BEGIN EXECUTE 'CREATE TABLE "Item" ("id" text)'; END $$;`
+
+		// a foreign key added in a DO block, under a lock timeout
+		lockSafeKey = `ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "ownerId" text;
+BEGIN;
+SET LOCAL lock_timeout = '500ms';
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'Item_ownerId_fkey') THEN
+    ALTER TABLE "Item" ADD CONSTRAINT "Item_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "Owner"("id");
+  END IF;
+END $$;
+COMMIT;`
+		addOwner    = `ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "ownerId" text;`
+		addOwnerKey = `ALTER TABLE "Item" ADD CONSTRAINT "Item_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "Owner"("id");`
+		keyed       = func(xid int64, lsn string) *wal.Data {
+			return ddlWalData(xid, lsn, lockSafeKey, "ALTER TABLE", `public."Item"`)
+		}
 	)
 
 	tests := []struct {
@@ -363,8 +380,24 @@ ALTER TABLE "Item_new" RENAME TO "Item";`
 			wantErr: errNoFiringStatement,
 		},
 		{
-			name:    "DDL run by procedural code fails",
+			name:    "DDL run by dynamic SQL fails",
 			events:  []*wal.Data{ddlWalData(7, "0/100", procedural, "CREATE TABLE", `public."Item"`)},
+			wantErr: errNoFiringStatement,
+		},
+		{
+			name:    "DDL written in a DO block replays its statement",
+			events:  []*wal.Data{keyed(7, "0/100"), keyed(7, "0/200")},
+			wantSQL: []string{addOwner, addOwnerKey},
+		},
+		{
+			name:    "DDL written in a DO block, sent again after a reconnection",
+			events:  []*wal.Data{keyed(7, "0/100"), keyed(7, "0/200"), keyed(7, "0/100"), keyed(7, "0/200")},
+			wantSQL: []string{addOwner, addOwnerKey, addOwner, addOwnerKey},
+		},
+		{
+			name:    "a third event on the table of a DO block fails",
+			events:  []*wal.Data{keyed(7, "0/100"), keyed(7, "0/200"), keyed(7, "0/300")},
+			wantSQL: []string{addOwner, addOwnerKey},
 			wantErr: errNoFiringStatement,
 		},
 	}

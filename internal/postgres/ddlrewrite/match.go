@@ -20,19 +20,14 @@ import (
 // objects). Without an object named in the text, as with an index Postgres
 // named itself, the tag alone is accepted when a single statement carries it.
 func MatchStatement(statements []string, from int, commandTag string, identities []string) (int, bool) {
-	names := make([]string, 0, len(identities))
-	for _, identity := range identities {
-		names = append(names, identityNames(identity)...)
-	}
+	names := eventNames(identities)
 
 	var tagged []int
 	for i := from; i < len(statements); i++ {
 		if !hasCommandTag(statements[i], commandTag) {
 			continue
 		}
-		if len(names) == 0 || slices.ContainsFunc(names, func(name string) bool {
-			return mentionsIdentifier(statements[i], name)
-		}) {
+		if namesObject(statements[i], names) {
 			return i, true
 		}
 		tagged = append(tagged, i)
@@ -41,6 +36,52 @@ func MatchStatement(statements []string, from int, commandTag string, identities
 		return tagged[0], true
 	}
 	return -1, false
+}
+
+// MatchFiringStatement finds the statement that fired a DDL event among
+// statements[from:], as MatchStatement does, the statements of DO blocks
+// included. A statement of a DO block is told only when nothing else can have
+// fired the event: the code around it may not have run it, so another
+// statement further on with the same command tag and object, or a block whose
+// DDL cannot be read, leaves the event untold.
+func MatchFiringStatement(statements []FiringStatement, from int, commandTag string, identities []string) (int, bool) {
+	texts := make([]string, len(statements))
+	for i, s := range statements {
+		if !s.Opaque {
+			texts[i] = s.SQL
+		}
+	}
+	i, ok := MatchStatement(texts, from, commandTag, identities)
+	if !ok || !statements[i].InBlock {
+		return i, ok
+	}
+	names := eventNames(identities)
+	for j := from; j < len(statements); j++ {
+		if statements[j].Opaque {
+			return -1, false
+		}
+		if j > i && hasCommandTag(texts[j], commandTag) && namesObject(texts[j], names) {
+			return -1, false
+		}
+	}
+	return i, true
+}
+
+// eventNames returns the names the objects of a DDL event are written with.
+func eventNames(identities []string) []string {
+	names := make([]string, 0, len(identities))
+	for _, identity := range identities {
+		names = append(names, identityNames(identity)...)
+	}
+	return names
+}
+
+// namesObject reports whether a statement names one of the objects of an
+// event, or the event names none.
+func namesObject(stmt string, names []string) bool {
+	return len(names) == 0 || slices.ContainsFunc(names, func(name string) bool {
+		return mentionsIdentifier(stmt, name)
+	})
 }
 
 // hasCommandTag reports whether a statement is one Postgres gives the command

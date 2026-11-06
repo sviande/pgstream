@@ -37,7 +37,7 @@ type ddlAdapter struct {
 type capturedQuery struct {
 	xid        int64
 	ddl        string
-	statements []string
+	statements []ddlrewrite.FiringStatement
 	next       int
 	lsn        replication.LSN
 }
@@ -99,9 +99,11 @@ func (a *ddlAdapter) walDataToQueries(ctx context.Context, d *wal.Data) ([]*quer
 // brings for them (a backfill inserted twice), and applied the later DDL ahead
 // of the rows written in between. Each event therefore replays its own
 // statement only, found from where the previous event of the same query
-// stopped. When it cannot be told, the event fails rather than replaying a
-// guess: DDL run by procedural code (DO, CALL, a function) is not in the
-// captured text at all.
+// stopped. DDL written in a DO block is found in the body of the block. When
+// it cannot be told, the event fails rather than replaying a guess: DDL run by
+// a function, a procedure (CALL) or dynamic SQL (EXECUTE) is not in the
+// captured text at all, and a statement of a DO block whose code may have
+// skipped it is told only when nothing else can have fired the event.
 //
 // The events of a query share their transaction ID and their text. After a
 // reconnection the source sends again, from its start, a transaction whose
@@ -113,7 +115,7 @@ func (a *ddlAdapter) firingStatement(xid int64, lsn replication.LSN, ddlEvent *w
 	q := &a.query
 	rewound := lsn != 0 && lsn <= q.lsn
 	if q.xid != xid || q.ddl != ddlEvent.DDL || rewound {
-		*q = capturedQuery{xid: xid, ddl: ddlEvent.DDL, statements: ddlrewrite.SplitStatements(ddlEvent.DDL)}
+		*q = capturedQuery{xid: xid, ddl: ddlEvent.DDL, statements: ddlrewrite.SplitFiringStatements(ddlEvent.DDL)}
 	}
 
 	identities := make([]string, 0, len(ddlEvent.Objects))
@@ -121,9 +123,9 @@ func (a *ddlAdapter) firingStatement(xid int64, lsn replication.LSN, ddlEvent *w
 		identities = append(identities, obj.Identity)
 	}
 
-	i, ok := ddlrewrite.MatchStatement(q.statements, q.next, ddlEvent.CommandTag, identities)
+	i, ok := ddlrewrite.MatchFiringStatement(q.statements, q.next, ddlEvent.CommandTag, identities)
 	if !ok && xid == 0 && q.next > 0 {
-		i, ok = ddlrewrite.MatchStatement(q.statements, 0, ddlEvent.CommandTag, identities)
+		i, ok = ddlrewrite.MatchFiringStatement(q.statements, 0, ddlEvent.CommandTag, identities)
 	}
 	if !ok {
 		return "", fmt.Errorf("%w: command tag %q, objects %q, xid %d, captured query: %s",
@@ -131,7 +133,7 @@ func (a *ddlAdapter) firingStatement(xid int64, lsn replication.LSN, ddlEvent *w
 	}
 	q.next = i + 1
 	q.lsn = lsn
-	return q.statements[i], nil
+	return q.statements[i].SQL, nil
 }
 
 func (a *ddlAdapter) newDDLQuery(schema, table, sql string) *query {
