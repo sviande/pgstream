@@ -67,6 +67,29 @@ func MatchFiringStatement(statements []FiringStatement, from int, commandTag str
 	return i, true
 }
 
+// ExtensionStatement returns the index of the first statement among
+// statements[from:] that runs the script of an extension, and false when there
+// is none.
+func ExtensionStatement(statements []FiringStatement, from int) (int, bool) {
+	for i := max(from, 0); i < len(statements); i++ {
+		if !statements[i].Opaque && IsExtensionStatement(statements[i].SQL) {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// IsExtensionStatement reports whether a statement runs the script of an
+// extension: CREATE EXTENSION, or ALTER EXTENSION for its UPDATE form. Postgres
+// fires one DDL event per command of the script (hundreds for btree_gist), each
+// under the command's own tag and carrying the captured text of the statement
+// that ran the script. emit_ddl leaves the objects of an extension out of an
+// event (in_extension), so these events name no object, and it emits no event
+// for the statement itself, an extension having no schema.
+func IsExtensionStatement(stmt string) bool {
+	return hasCommandTag(stmt, "CREATE EXTENSION") || hasCommandTag(stmt, "ALTER EXTENSION")
+}
+
 // eventNames returns the names the objects of a DDL event are written with.
 func eventNames(identities []string) []string {
 	names := make([]string, 0, len(identities))

@@ -336,6 +336,30 @@ COMMIT;`
 		keyed       = func(xid int64, lsn string) *wal.Data {
 			return ddlWalData(xid, lsn, lockSafeKey, "ALTER TABLE", `public."Item"`)
 		}
+
+		// an exclusion constraint that needs an extension installed by the same
+		// migration: the script of the extension fires an event per command,
+		// none naming an object, and the statement fires none of its own
+		exclusion = `ALTER TABLE "Item" ADD CONSTRAINT "Item_amount_check" CHECK ("amount" > 0);
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE "Slot" ADD CONSTRAINT "Slot_no_overlap" EXCLUDE USING gist ("itemId" WITH =, "period" WITH &&);
+CREATE FUNCTION slot_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;`
+		addCheck     = `ALTER TABLE "Item" ADD CONSTRAINT "Item_amount_check" CHECK ("amount" > 0);`
+		addExtension = `CREATE EXTENSION IF NOT EXISTS btree_gist;`
+		addExclusion = `ALTER TABLE "Slot" ADD CONSTRAINT "Slot_no_overlap" EXCLUDE USING gist ("itemId" WITH =, "period" WITH &&);`
+		addGuard     = `CREATE FUNCTION slot_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;`
+		checked      = func(lsn string) *wal.Data {
+			return ddlWalData(7, lsn, exclusion, "ALTER TABLE", `public."Item"`)
+		}
+		scripted = func(lsn, commandTag string) *wal.Data {
+			return ddlWalData(7, lsn, exclusion, commandTag)
+		}
+		excluded = func(lsn string) *wal.Data {
+			return ddlWalData(7, lsn, exclusion, "ALTER TABLE", `public."Slot"`)
+		}
+		guarded = func(lsn string) *wal.Data {
+			return ddlWalData(7, lsn, exclusion, "CREATE FUNCTION", "public.slot_guard()")
+		}
 	)
 
 	tests := []struct {
@@ -398,6 +422,38 @@ COMMIT;`
 			name:    "a third event on the table of a DO block fails",
 			events:  []*wal.Data{keyed(7, "0/100"), keyed(7, "0/200"), keyed(7, "0/300")},
 			wantSQL: []string{addOwner, addOwnerKey},
+			wantErr: errNoFiringStatement,
+		},
+		{
+			name: "the script of an extension replays the statement that ran it, once",
+			events: []*wal.Data{
+				checked("0/100"),
+				scripted("0/200", "CREATE FUNCTION"), scripted("0/300", "CREATE TYPE"),
+				scripted("0/400", "CREATE OPERATOR CLASS"), scripted("0/500", "ALTER FUNCTION"),
+				excluded("0/600"), guarded("0/700"),
+			},
+			wantSQL: []string{addCheck, addExtension, "", "", "", addExclusion, addGuard},
+		},
+		{
+			name: "the script of an extension, sent again after a reconnection",
+			events: []*wal.Data{
+				checked("0/100"), scripted("0/200", "CREATE FUNCTION"), scripted("0/300", "CREATE TYPE"),
+				checked("0/100"), scripted("0/200", "CREATE FUNCTION"), scripted("0/300", "CREATE TYPE"), excluded("0/600"),
+			},
+			wantSQL: []string{addCheck, addExtension, "", addCheck, addExtension, "", addExclusion},
+		},
+		{
+			name: "an event naming no object after the statements past the extension fails",
+			events: []*wal.Data{
+				checked("0/100"), scripted("0/200", "CREATE FUNCTION"), excluded("0/600"), guarded("0/700"),
+				scripted("0/800", "CREATE TYPE"),
+			},
+			wantSQL: []string{addCheck, addExtension, addExclusion, addGuard},
+			wantErr: errNoFiringStatement,
+		},
+		{
+			name:    "an event naming no object without an extension statement fails",
+			events:  []*wal.Data{ddlWalData(7, "0/100", rebuild, "CREATE FUNCTION")},
 			wantErr: errNoFiringStatement,
 		},
 	}

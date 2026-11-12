@@ -215,3 +215,38 @@ func TestIdentityNames(t *testing.T) {
 		})
 	}
 }
+
+func TestExtensionStatement(t *testing.T) {
+	t.Parallel()
+
+	statements := SplitFiringStatements(`ALTER TABLE "Item" ADD COLUMN "sku" text;
+-- needed by the exclusion constraint below
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER EXTENSION pg_trgm UPDATE;
+DO $$ BEGIN EXECUTE 'CREATE EXTENSION cube'; END $$;
+COMMENT ON EXTENSION btree_gist IS 'gist';`)
+
+	tests := []struct {
+		name string
+		from int
+
+		wantIndex int
+		wantFound bool
+	}{
+		{name: "from the start", from: 0, wantIndex: 1, wantFound: true},
+		{name: "from the statement itself", from: 1, wantIndex: 1, wantFound: true},
+		{name: "an update of an extension", from: 2, wantIndex: 2, wantFound: true},
+		{name: "dynamic SQL and comments on an extension run no script", from: 3, wantIndex: -1},
+		{name: "past the end", from: 9, wantIndex: -1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			i, found := ExtensionStatement(statements, tc.from)
+			require.Equal(t, tc.wantIndex, i)
+			require.Equal(t, tc.wantFound, found)
+		})
+	}
+}
