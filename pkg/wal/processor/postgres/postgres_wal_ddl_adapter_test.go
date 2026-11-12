@@ -337,6 +337,30 @@ COMMIT;`
 			return ddlWalData(xid, lsn, lockSafeKey, "ALTER TABLE", `public."Item"`)
 		}
 
+		// a column and its foreign key added in one DO block that retries until
+		// it gets the lock: two ALTER TABLE events on the same table
+		lockRetry = `BEGIN;
+SET LOCAL lock_timeout = '500ms';
+DO $$
+BEGIN
+  FOR attempt IN 1..20 LOOP
+    BEGIN
+      ALTER TABLE "Item" ADD COLUMN "ownerId" text;
+      ALTER TABLE "Item" ADD CONSTRAINT "Item_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "Owner"("id") NOT VALID;
+      RETURN;
+    EXCEPTION WHEN lock_not_available THEN
+      PERFORM pg_sleep(1);
+    END;
+  END LOOP;
+  RAISE EXCEPTION 'Item stayed locked' USING ERRCODE = 'lock_not_available';
+END $$;
+COMMIT;`
+		addOwnerColumn  = `ALTER TABLE "Item" ADD COLUMN "ownerId" text;`
+		addOwnerInvalid = `ALTER TABLE "Item" ADD CONSTRAINT "Item_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "Owner"("id") NOT VALID;`
+		retried         = func(xid int64, lsn string) *wal.Data {
+			return ddlWalData(xid, lsn, lockRetry, "ALTER TABLE", `public."Item"`)
+		}
+
 		// an exclusion constraint that needs an extension installed by the same
 		// migration: the script of the extension fires an event per command,
 		// none naming an object, and the statement fires none of its own
@@ -422,6 +446,17 @@ CREATE FUNCTION slot_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN
 			name:    "a third event on the table of a DO block fails",
 			events:  []*wal.Data{keyed(7, "0/100"), keyed(7, "0/200"), keyed(7, "0/300")},
 			wantSQL: []string{addOwner, addOwnerKey},
+			wantErr: errNoFiringStatement,
+		},
+		{
+			name:    "two statements in a row on one table in a DO block replay in text order",
+			events:  []*wal.Data{retried(7, "0/100"), retried(7, "0/200")},
+			wantSQL: []string{addOwnerColumn, addOwnerInvalid},
+		},
+		{
+			name:    "a third event on the table of two statements in a row fails",
+			events:  []*wal.Data{retried(7, "0/100"), retried(7, "0/200"), retried(7, "0/300")},
+			wantSQL: []string{addOwnerColumn, addOwnerInvalid},
 			wantErr: errNoFiringStatement,
 		},
 		{

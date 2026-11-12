@@ -29,10 +29,37 @@ BEGIN
 END $$;
 COMMIT;`
 
+// lockRetryMigration adds a column and its foreign key to a table written on
+// every request: both in one DO block that retries until it gets the lock, so
+// the block fires two ALTER TABLE events on the same table.
+const lockRetryMigration = `-- The column and its key, under a lock taken for 500 ms at most per attempt.
+BEGIN;
+SET LOCAL lock_timeout = '500ms';
+
+DO $$
+BEGIN
+  FOR attempt IN 1..20 LOOP
+    BEGIN
+      ALTER TABLE "Event" ADD COLUMN "envelopeId" TEXT;
+
+      ALTER TABLE "Event"
+        ADD CONSTRAINT "Event_envelopeId_fkey" FOREIGN KEY ("envelopeId") REFERENCES "Envelope"("id") NOT VALID;
+
+      RETURN;
+    EXCEPTION WHEN lock_not_available THEN
+      PERFORM pg_sleep(1);
+    END;
+  END LOOP;
+  RAISE EXCEPTION 'Event stayed locked' USING ERRCODE = 'lock_not_available';
+END $$;
+
+COMMIT;`
+
 func TestSplitFiringStatements(t *testing.T) {
 	t.Parallel()
 
-	inBlock := func(sql string) FiringStatement { return FiringStatement{SQL: sql, InBlock: true} }
+	inRun := func(run int, sql string) FiringStatement { return FiringStatement{SQL: sql, InBlock: true, Run: run} }
+	inBlock := func(sql string) FiringStatement { return inRun(1, sql) }
 
 	tests := []struct {
 		name string
@@ -91,13 +118,33 @@ BEGIN
   END LOOP retry;
 END $$;`,
 			want: []FiringStatement{
-				inBlock(`n integer := 0;`),
-				inBlock(`SELECT count(*) INTO n FROM "Item";`),
-				inBlock(`DROP TABLE "Item";`),
-				inBlock(`ALTER TABLE "Item" ADD COLUMN "archived" boolean;`),
-				inBlock(`CREATE TRIGGER "item_audit" AFTER UPDATE ON "Item" FOR EACH ROW EXECUTE FUNCTION audit();`),
-				inBlock(`CREATE TABLE "Item" ("id" text);`),
-				inBlock(`n := n - 1;`),
+				inRun(1, `n integer := 0;`),
+				inRun(2, `SELECT count(*) INTO n FROM "Item";`),
+				inRun(3, `DROP TABLE "Item";`),
+				inRun(4, `ALTER TABLE "Item" ADD COLUMN "archived" boolean;`),
+				inRun(5, `CREATE TRIGGER "item_audit" AFTER UPDATE ON "Item" FOR EACH ROW EXECUTE FUNCTION audit();`),
+				inRun(6, `CREATE TABLE "Item" ("id" text);`),
+				inRun(7, `n := n - 1;`),
+			},
+		},
+		{
+			name: "statements written one after the other share a run",
+			sql:  lockRetryMigration,
+			want: []FiringStatement{
+				{SQL: "-- The column and its key, under a lock taken for 500 ms at most per attempt.\nBEGIN;"},
+				{SQL: `SET LOCAL lock_timeout = '500ms';`},
+				inRun(1, `ALTER TABLE "Event" ADD COLUMN "envelopeId" TEXT;`),
+				inRun(1, "ALTER TABLE \"Event\"\n        ADD CONSTRAINT \"Event_envelopeId_fkey\" FOREIGN KEY (\"envelopeId\") REFERENCES \"Envelope\"(\"id\") NOT VALID;"),
+				{SQL: `COMMIT;`},
+			},
+		},
+		{
+			name: "runs are numbered across the blocks of a query",
+			sql: `DO $$ BEGIN DROP TABLE "A"; DROP TABLE "B"; RAISE NOTICE 'dropped'; DROP TABLE "C"; END $$;
+DO $$ BEGIN DROP TABLE "D"; END $$;`,
+			want: []FiringStatement{
+				inRun(1, `DROP TABLE "A";`), inRun(1, `DROP TABLE "B";`), inRun(2, `DROP TABLE "C";`),
+				inRun(3, `DROP TABLE "D";`),
 			},
 		},
 		{
@@ -188,6 +235,39 @@ func TestMatchFiringStatement(t *testing.T) {
 		{
 			name:       "two branches on the same table",
 			sql:        `DO $$ BEGIN IF true THEN ALTER TABLE "Draft" ADD COLUMN "a" int; ELSE ALTER TABLE "Draft" ADD COLUMN "b" int; END IF; END $$;`,
+			identities: []string{draft},
+			wantOK:     false,
+		},
+		{
+			name:       "two statements of one run on the same table: the first fired the first event",
+			sql:        lockRetryMigration,
+			identities: []string{`public."Event"`},
+			wantIndex:  2,
+			wantOK:     true,
+		},
+		{
+			name:       "two statements of one run on the same table: the second fired the next event",
+			sql:        lockRetryMigration,
+			from:       3,
+			identities: []string{`public."Event"`},
+			wantIndex:  3,
+			wantOK:     true,
+		},
+		{
+			name:       "the first statement of a run may do nothing: IF NOT EXISTS",
+			sql:        `DO $$ BEGIN ALTER TABLE "Draft" ADD COLUMN IF NOT EXISTS "a" int; ALTER TABLE "Draft" ADD COLUMN "b" int; END $$;`,
+			identities: []string{draft},
+			wantOK:     false,
+		},
+		{
+			name:       "a control statement between two statements on the same table",
+			sql:        `DO $$ BEGIN ALTER TABLE "Draft" ADD COLUMN "a" int; IF false THEN RETURN; END IF; ALTER TABLE "Draft" ADD COLUMN "b" int; END $$;`,
+			identities: []string{draft},
+			wantOK:     false,
+		},
+		{
+			name:       "a run on the same table, then another statement on it past the run",
+			sql:        `DO $$ BEGIN ALTER TABLE "Draft" ADD COLUMN "a" int; ALTER TABLE "Draft" ADD COLUMN "b" int; END $$;` + "\n" + addColumn,
 			identities: []string{draft},
 			wantOK:     false,
 		},

@@ -3,6 +3,7 @@
 package ddlrewrite
 
 import (
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -44,6 +45,13 @@ func MatchStatement(statements []string, from int, commandTag string, identities
 // fired the event: the code around it may not have run it, so another
 // statement further on with the same command tag and object, or a block whose
 // DDL cannot be read, leaves the event untold.
+//
+// Another statement of the same run does not stand in the way: the code cannot
+// reach it without having run the matched one, which fired its event first (a
+// migration adding a column then its foreign key in one block, both ALTER
+// TABLE on the same table). This holds only for a statement that fires an
+// event whenever it runs, so not for one written with IF EXISTS or IF NOT
+// EXISTS, which may do nothing.
 func MatchFiringStatement(statements []FiringStatement, from int, commandTag string, identities []string) (int, bool) {
 	texts := make([]string, len(statements))
 	for i, s := range statements {
@@ -60,7 +68,7 @@ func MatchFiringStatement(statements []FiringStatement, from int, commandTag str
 		if statements[j].Opaque {
 			return -1, false
 		}
-		if j > i && hasCommandTag(texts[j], commandTag) && namesObject(texts[j], names) {
+		if j > i && hasCommandTag(texts[j], commandTag) && namesObject(texts[j], names) && !runsAfter(statements[i], statements[j]) {
 			return -1, false
 		}
 	}
@@ -89,6 +97,17 @@ func ExtensionStatement(statements []FiringStatement, from int) (int, bool) {
 func IsExtensionStatement(stmt string) bool {
 	return hasCommandTag(stmt, "CREATE EXTENSION") || hasCommandTag(stmt, "ALTER EXTENSION")
 }
+
+// runsAfter reports whether the code can only run later after first, with
+// first firing an event: both in the same run of a DO block, and first not
+// written to do nothing when its object exists already or is missing.
+func runsAfter(first, later FiringStatement) bool {
+	return first.Run != 0 && first.Run == later.Run && !existenceClause.MatchString(first.SQL)
+}
+
+// existenceClause matches IF EXISTS and IF NOT EXISTS. A match in a literal or
+// a comment only makes the statement stricter to match.
+var existenceClause = regexp.MustCompile(`(?i)\bIF\s+(NOT\s+)?EXISTS\b`)
 
 // eventNames returns the names the objects of a DDL event are written with.
 func eventNames(identities []string) []string {

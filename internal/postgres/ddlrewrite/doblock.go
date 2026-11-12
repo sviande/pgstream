@@ -10,6 +10,12 @@ type FiringStatement struct {
 	// InBlock marks a statement written in the body of a DO block: the
 	// procedural code around it decides whether it runs, so it may not have.
 	InBlock bool
+	// Run numbers the sequence a statement of a DO block belongs to: statements
+	// written one right after the other, with no control statement, block or
+	// label in between, share it. The code runs such a sequence in text order
+	// and cannot reach a statement without having run the ones before it. It is
+	// zero outside a block and unique within a captured query.
+	Run int
 	// Opaque marks a DO block whose DDL cannot be read from its text: dynamic
 	// SQL (EXECUTE), a language other than PL/pgSQL, a body that cannot be
 	// found. SQL holds the whole block.
@@ -24,7 +30,10 @@ type FiringStatement struct {
 // top-level statements. A block whose DDL cannot be read stays as one opaque
 // statement.
 func SplitFiringStatements(sql string) []FiringStatement {
-	var statements []FiringStatement
+	var (
+		statements []FiringStatement
+		runs       int
+	)
 	for _, stmt := range SplitStatements(sql) {
 		if !isDOBlock(stmt) {
 			statements = append(statements, FiringStatement{SQL: stmt})
@@ -35,9 +44,12 @@ func SplitFiringStatements(sql string) []FiringStatement {
 			statements = append(statements, FiringStatement{SQL: stmt, Opaque: true})
 			continue
 		}
+		last := runs
 		for _, s := range body {
-			statements = append(statements, FiringStatement{SQL: s, InBlock: true})
+			statements = append(statements, FiringStatement{SQL: s.sql, InBlock: true, Run: runs + s.run})
+			last = runs + s.run
 		}
+		runs = last
 	}
 	return statements
 }
@@ -50,7 +62,7 @@ func isDOBlock(stmt string) bool {
 // doBlockStatements returns the SQL statements written in the PL/pgSQL body of
 // a DO block, in text order, and false when the DDL of the block cannot be
 // read from its text.
-func doBlockStatements(stmt string) ([]string, bool) {
+func doBlockStatements(stmt string) ([]plStatement, bool) {
 	body, ok := doBlockBody(stmt)
 	if !ok {
 		return nil, false
@@ -93,17 +105,30 @@ func doBlockBody(stmt string) (string, bool) {
 // conditions of IF, WHILE, FOR and WHEN, and expressions in parentheses, are
 // skipped. EXECUTE runs a text built at run time, so a block holding one is
 // left unread.
-func plpgsqlStatements(body string) ([]string, bool) {
+//
+// Each statement comes with the number of its run, counted from one: a
+// statement starting right after the semicolon of the previous one continues
+// its run, anything in between (a control statement, a block keyword, a label)
+// starts another.
+func plpgsqlStatements(body string) ([]plStatement, bool) {
 	runes := []rune(body)
 	tokens := lexPL(runes)
 
 	var (
-		statements []string
+		statements []plStatement
 		depth      int
 		start      = -1 // first token of the SQL statement being read
 		atStart    = true
 		inEnd      = false // END IF, END LOOP, END label: skipped to its semicolon
+		run        int
+		lastEnd    = -2 // semicolon of the last SQL statement read
 	)
+	begin := func(i int) {
+		if i != lastEnd+1 {
+			run++
+		}
+		start, atStart = i, false
+	}
 	for i := 0; i < len(tokens); i++ {
 		tok := tokens[i]
 		switch {
@@ -117,7 +142,8 @@ func plpgsqlStatements(body string) ([]string, bool) {
 			continue
 		case tok.isPunct(';'):
 			if start >= 0 {
-				statements = append(statements, strings.TrimSpace(string(runes[tokens[start].start:tok.end])))
+				statements = append(statements, plStatement{sql: strings.TrimSpace(string(runes[tokens[start].start:tok.end])), run: run})
+				lastEnd = i
 			}
 			start, atStart, inEnd = -1, true, false
 			continue
@@ -129,7 +155,7 @@ func plpgsqlStatements(body string) ([]string, bool) {
 		case tok.kind != tokWord:
 			if atStart {
 				// an assignment target written as a quoted identifier, say
-				start, atStart = i, false
+				begin(i)
 			}
 			continue
 		}
@@ -154,13 +180,20 @@ func plpgsqlStatements(body string) ([]string, bool) {
 				atStart = false
 				continue
 			}
-			start, atStart = i, false
+			begin(i)
 		}
 	}
 	if start >= 0 {
-		statements = append(statements, strings.TrimSpace(string(runes[tokens[start].start:])))
+		statements = append(statements, plStatement{sql: strings.TrimSpace(string(runes[tokens[start].start:])), run: run})
 	}
 	return statements, true
+}
+
+// plStatement is a SQL statement of a PL/pgSQL block, with the number of its
+// run.
+type plStatement struct {
+	sql string
+	run int
 }
 
 // labelEnd returns the position of the closing >> of a <<label>> whose
